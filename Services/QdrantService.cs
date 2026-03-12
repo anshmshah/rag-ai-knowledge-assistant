@@ -217,5 +217,31 @@ namespace LocalRagAPI.Services
 
             return scroll.Result != null && scroll.Result.Any();
         }
+
+        public async Task DeleteByDocumentAsync(string documentName)
+        {
+            var filter = new Filter
+            {
+                Must =
+        {
+            new Condition
+            {
+                Field = new FieldCondition
+                {
+                    Key = "document",
+                    Match = new Match
+                    {
+                        Keyword = documentName
+                    }
+                }
+            }
+        }
+            };
+
+            await _client.DeleteAsync(
+                collectionName: COLLECTION,
+                filter: filter
+            );
+        }
     }
 }
