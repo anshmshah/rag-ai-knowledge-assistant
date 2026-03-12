@@ -320,6 +320,8 @@
                 const lastIndex = this.messages.length - 1
                 this.messages[lastIndex].content = "Error contacting AI service."
 
+                this.thinking = false
+
             }
 
             this.scrollBottom()
@@ -431,7 +433,9 @@
                 const text = await res.text()
 
                 this.uploadProgress = 100
-                this.uploadMessage = text
+                this.uploadMessage = "Document uploaded. Indexing in progress..."
+                //this.uploadMessage = text
+
 
                 if (!this.documents.includes(file.name)) {
                     this.documents.push(file.name)
