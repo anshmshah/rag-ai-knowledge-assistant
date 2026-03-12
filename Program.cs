@@ -8,17 +8,28 @@ builder.Services.AddControllers();
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
-builder.Services.AddHttpClient<ILLMService, GroqLLMService>();
+// Configure HTTP clients with increased connection limits for throughput
+builder.Services.AddHttpClient<ILLMService, GroqLLMService>()
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { MaxConnectionsPerServer = 50 });
+
 builder.Services.AddSingleton<VectorStore>();
 builder.Services.AddSingleton<ChatMemory>();
-//builder.Services.AddSingleton<IEmbeddingService, JinaEmbeddingService>();
-builder.Services.AddHttpClient<JinaEmbeddingService>();
-builder.Services.AddHttpClient<JinaRerankerService>();
+
+builder.Services.AddHttpClient<JinaEmbeddingService>()
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { MaxConnectionsPerServer = 50 });
+
+builder.Services.AddHttpClient<JinaRerankerService>()
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { MaxConnectionsPerServer = 50 });
+
 builder.Services.AddSingleton<QdrantService>();
 builder.Services.AddSingleton<PromptBuilderService>();
 
 ModelTestService.TestModel();
 var app = builder.Build();
+
+// Add middleware for request logging and global error handling
+app.UseMiddleware<LocalRagAPI.Middleware.ErrorHandlingMiddleware>();
+app.UseMiddleware<LocalRagAPI.Middleware.RequestLoggingMiddleware>();
 
 using (var scope = app.Services.CreateScope())
 {

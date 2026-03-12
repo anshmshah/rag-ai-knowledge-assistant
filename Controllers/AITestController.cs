@@ -31,6 +31,7 @@ namespace LocalRagAPI.Controllers
         private readonly JinaRerankerService _reranker;
         private readonly QdrantService _qdrant;
         private readonly PromptBuilderService _promptBuilder;
+        private readonly Microsoft.Extensions.Logging.ILogger<AITestController> _logger;
 
         public AITestController(
             ILLMService llm,
@@ -38,7 +39,8 @@ namespace LocalRagAPI.Controllers
             ChatMemory memory,
             JinaRerankerService reranker,
             QdrantService qdrant,
-            PromptBuilderService promptBuilder)
+            PromptBuilderService promptBuilder,
+            Microsoft.Extensions.Logging.ILogger<AITestController> logger)
         {
             _llm = llm;
             _embeddingService = embeddingService;
@@ -46,6 +48,7 @@ namespace LocalRagAPI.Controllers
             _reranker = reranker;
             _qdrant = qdrant;
             _promptBuilder = promptBuilder;
+            _logger = logger;
         }
 
         [HttpGet]
@@ -931,10 +934,13 @@ Assistant:
             }
 
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            _logger?.LogInformation("Starting upload processing for {FileName} size={Size}", file.FileName, file.Length);
 
             await ProcessDocument(text, file.FileName);
 
             stopwatch.Stop();
+
+            _logger?.LogInformation("Finished processing {FileName} in {Elapsed}ms", file.FileName, stopwatch.ElapsedMilliseconds);
 
             return $"File processed successfully in {stopwatch.ElapsedMilliseconds} ms";
         }
@@ -942,37 +948,6 @@ Assistant:
         // =========================
         // DOCUMENT PROCESSING
         // =========================
-        private async Task ProcessDocument(string text, string documentName)
-        {
-
-            var sentences = text
-    .Split(new[] { ".", "!", "?" }, StringSplitOptions.RemoveEmptyEntries)
-    .Select(s => s.Trim())
-    .Where(s => !string.IsNullOrWhiteSpace(s))
-    .ToList();
-
-            int chunkSentenceSize = 6;
-            int overlap = 2;
-            int maxChunks = 300;
-
-            var chunks = new List<string>();
-
-            for (int i = 0; i < sentences.Count; i += (chunkSentenceSize - overlap))
-            {
-                var chunkSentences = sentences
-                    .Skip(i)
-                    .Take(chunkSentenceSize)
-                    .ToList();
-
-                if (!chunkSentences.Any())
-                    break;
-
-                var chunkText = string.Join(". ", chunkSentences) + ".";
-                chunks.Add(chunkText);
-
-                if (chunks.Count >= maxChunks)
-                    break;
-            }
             //var words = text.Split(" ", StringSplitOptions.RemoveEmptyEntries);
 
             //int chunkSize = 250;
@@ -1020,33 +995,106 @@ Assistant:
             //}
 
             // Batch embedding requests to avoid huge payloads and improve throughput
-            int batchSize = 100;
+        private async Task ProcessDocument(string text, string documentName)
+        {
+            var swTotal = System.Diagnostics.Stopwatch.StartNew();
 
+            var sentences = text
+                .Split(new[] { ".", "!", "?" }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim())
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .ToList();
+
+            int chunkSentenceSize = 6;
+            int overlap = 2;
+            int maxChunks = 300;
+
+            var chunks = new List<string>();
+
+            for (int i = 0; i < sentences.Count; i += (chunkSentenceSize - overlap))
+            {
+                var chunkSentences = sentences
+                    .Skip(i)
+                    .Take(chunkSentenceSize)
+                    .ToList();
+
+                if (!chunkSentences.Any())
+                    break;
+
+                var chunkText = string.Join(". ", chunkSentences) + ".";
+                chunks.Add(chunkText);
+
+                if (chunks.Count >= maxChunks)
+                    break;
+            }
+
+            // Batch embedding requests to avoid huge payloads and improve throughput
+            // Increased batch size to reduce total number of embedding requests.
+            int batchSize = 256;
+
+            // Build list of batches
+            var batches = new List<List<string>>();
             for (int i = 0; i < chunks.Count; i += batchSize)
             {
-                var batch = chunks.Skip(i).Take(batchSize).ToList();
-                var embBatch = await _embeddingService.GenerateEmbeddings(batch);
-
-                // prepare batch points for upsert
-                var points = new List<Qdrant.Client.Grpc.PointStruct>();
-
-                for (int j = 0; j < embBatch.Count; j++)
-                {
-                    var point = new Qdrant.Client.Grpc.PointStruct
-                    {
-                        Id = new Qdrant.Client.Grpc.PointId { Uuid = Guid.NewGuid().ToString() },
-                        Vectors = embBatch[j]
-                    };
-
-                    point.Payload.Add("document", documentName);
-                    point.Payload.Add("content", batch[j]);
-
-                    points.Add(point);
-                }
-
-                // batch upsert to Qdrant
-                await _qdrant.BatchUpsertAsync(points);
+                batches.Add(chunks.Skip(i).Take(batchSize).ToList());
             }
+
+            int maxConcurrency = 3; // controlled concurrency for embedding requests
+            var semaphore = new System.Threading.SemaphoreSlim(maxConcurrency);
+            var tasks = new List<Task>();
+
+            for (int b = 0; b < batches.Count; b++)
+            {
+                var batchIndex = b;
+                var batch = batches[b];
+
+                var work = Task.Run(async () =>
+                {
+                    await semaphore.WaitAsync();
+                    try
+                    {
+                        var swBatch = System.Diagnostics.Stopwatch.StartNew();
+                        var embBatch = await _embeddingService.GenerateEmbeddings(batch);
+                        swBatch.Stop();
+                        _logger?.LogInformation("Embedding batch {BatchIndex}: generated {Count} embeddings in {Elapsed}ms", batchIndex, embBatch.Count, swBatch.ElapsedMilliseconds);
+
+                        var points = new List<Qdrant.Client.Grpc.PointStruct>();
+                        for (int j = 0; j < embBatch.Count; j++)
+                        {
+                            var point = new Qdrant.Client.Grpc.PointStruct
+                            {
+                                Id = new Qdrant.Client.Grpc.PointId { Uuid = Guid.NewGuid().ToString() },
+                                Vectors = embBatch[j]
+                            };
+
+                            point.Payload.Add("document", documentName);
+                            point.Payload.Add("content", batch[j]);
+                            points.Add(point);
+                        }
+
+                        var swUpsert = System.Diagnostics.Stopwatch.StartNew();
+                        await _qdrant.BatchUpsertAsync(points);
+                        swUpsert.Stop();
+                        _logger?.LogInformation("Upsert batch {BatchIndex}: upserted {Count} points in {Elapsed}ms", batchIndex, points.Count, swUpsert.ElapsedMilliseconds);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogError(ex, "Error processing embedding batch {BatchIndex}", batchIndex);
+                        throw;
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                });
+
+                tasks.Add(work);
+            }
+
+            await Task.WhenAll(tasks);
+
+            swTotal.Stop();
+            _logger?.LogInformation("Processed document {DocumentName}: totalChunks={Chunks} totalElapsed={Elapsed}ms", documentName, chunks.Count, swTotal.ElapsedMilliseconds);
         }
 
         private bool NeedsRewrite(string question)

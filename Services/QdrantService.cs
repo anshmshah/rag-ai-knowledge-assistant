@@ -7,9 +7,11 @@ namespace LocalRagAPI.Services
     {
         private readonly QdrantClient _client;
         private const string COLLECTION = "documents";
+        private readonly Microsoft.Extensions.Logging.ILogger<QdrantService> _logger;
 
-        public QdrantService()
+        public QdrantService(Microsoft.Extensions.Logging.ILogger<QdrantService> logger)
         {
+            _logger = logger;
             AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
             _client = new QdrantClient("localhost", 6334);
         }
@@ -167,10 +169,19 @@ namespace LocalRagAPI.Services
             if (points == null || !points.Any())
                 return;
 
-            await _client.UpsertAsync(
-                COLLECTION,
-                points
-            );
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                await _client.UpsertAsync(
+                    COLLECTION,
+                    points
+                );
+            }
+            finally
+            {
+                sw.Stop();
+                _logger?.LogInformation("Upserted {Count} points in {Elapsed}ms", points.Count, sw.ElapsedMilliseconds);
+            }
         }
 
         public async Task<bool> HasPointsAsync(string documentFilter = null)
