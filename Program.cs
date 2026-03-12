@@ -15,6 +15,7 @@ builder.Services.AddSingleton<ChatMemory>();
 builder.Services.AddHttpClient<JinaEmbeddingService>();
 builder.Services.AddHttpClient<JinaRerankerService>();
 builder.Services.AddSingleton<QdrantService>();
+builder.Services.AddSingleton<PromptBuilderService>();
 
 ModelTestService.TestModel();
 var app = builder.Build();

@@ -61,7 +61,12 @@ namespace LocalRagAPI.Services
         // VECTOR SEARCH
         // =========================
 
-        public async Task<List<string>> Search(float[] embedding, string documentFilter = null)
+        public async Task<List<LocalRagAPI.Models.SearchResultItem>> Search(float[] embedding, string documentFilter = null)
+        {
+            return await Search(embedding, documentFilter, 20);
+        }
+
+        public async Task<List<LocalRagAPI.Models.SearchResultItem>> Search(float[] embedding, string documentFilter = null, int limit = 20)
         {
             Filter filter = null;
 
@@ -90,16 +95,22 @@ namespace LocalRagAPI.Services
             var results = await _client.SearchAsync(
                 collectionName: COLLECTION,
                 vector: embedding,
-                limit: 20,
+                limit: (uint)limit,
                 filter: filter
             );
 
             return results
-                .Select(r => r.Payload["content"].StringValue)
+                .Select(r => new LocalRagAPI.Models.SearchResultItem
+                {
+                    Content = r.Payload.ContainsKey("content") ? r.Payload["content"].StringValue : string.Empty,
+                    Document = r.Payload.ContainsKey("document") ? r.Payload["document"].StringValue : string.Empty,
+                    Score = (float)r.Score,
+                    PointId = r.Id != null ? (r.Id.Uuid ?? r.Id.ToString() ?? string.Empty) : string.Empty
+                })
                 .ToList();
         }
 
-        public async Task<List<string>> KeywordSearch(string query, string documentFilter = null)
+        public async Task<List<LocalRagAPI.Models.SearchResultItem>> KeywordSearch(string query, string documentFilter = null, int limit = 20)
         {
             var mustConditions = new List<Condition>();
 
@@ -137,12 +148,63 @@ namespace LocalRagAPI.Services
             var scroll = await _client.ScrollAsync(
                 collectionName: COLLECTION,
                 filter: filter,
-                limit: 20
+                limit: (uint)limit
             );
 
             return scroll.Result
-                .Select(r => r.Payload["content"].StringValue)
+                .Select(r => new LocalRagAPI.Models.SearchResultItem
+                {
+                    Content = r.Payload.ContainsKey("content") ? r.Payload["content"].StringValue : string.Empty,
+                    Document = r.Payload.ContainsKey("document") ? r.Payload["document"].StringValue : string.Empty,
+                    Score = 0f,
+                    PointId = r.Id != null ? (r.Id.Uuid ?? r.Id.ToString() ?? string.Empty) : string.Empty
+                })
                 .ToList();
+        }
+
+        public async Task BatchUpsertAsync(List<PointStruct> points)
+        {
+            if (points == null || !points.Any())
+                return;
+
+            await _client.UpsertAsync(
+                COLLECTION,
+                points
+            );
+        }
+
+        public async Task<bool> HasPointsAsync(string documentFilter = null)
+        {
+            Filter filter = null;
+
+            if (!string.IsNullOrEmpty(documentFilter))
+            {
+                filter = new Filter
+                {
+                    Must =
+                    {
+                        new Condition
+                        {
+                            Field = new FieldCondition
+                            {
+                                Key = "document",
+                                Match = new Match
+                                {
+                                    Keyword = documentFilter
+                                }
+                            }
+                        }
+                    }
+                };
+            }
+
+            var scroll = await _client.ScrollAsync(
+                collectionName: COLLECTION,
+                filter: filter,
+                limit: (uint)1
+            );
+
+            return scroll.Result != null && scroll.Result.Any();
         }
     }
 }

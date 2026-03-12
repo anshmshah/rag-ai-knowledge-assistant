@@ -42,7 +42,7 @@ namespace LocalRagAPI.Services
             var result = JsonSerializer.Deserialize<RerankResponse>(json);
 
             return result.results
-                .Where(r => r.relevance_score > 0.1)
+                .Where(r => r.relevance_score > 0.2)
                 .OrderByDescending(r => r.relevance_score)
                 .Select(r => documents[r.index])
                 .Take(5)

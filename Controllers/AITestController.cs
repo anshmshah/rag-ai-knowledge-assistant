@@ -30,19 +30,22 @@ namespace LocalRagAPI.Controllers
         private readonly ChatMemory _memory;
         private readonly JinaRerankerService _reranker;
         private readonly QdrantService _qdrant;
+        private readonly PromptBuilderService _promptBuilder;
 
         public AITestController(
             ILLMService llm,
             JinaEmbeddingService embeddingService,
             ChatMemory memory,
             JinaRerankerService reranker,
-            QdrantService qdrant)
+            QdrantService qdrant,
+            PromptBuilderService promptBuilder)
         {
             _llm = llm;
             _embeddingService = embeddingService;
             _memory = memory;
             _reranker = reranker;
             _qdrant = qdrant;
+            _promptBuilder = promptBuilder;
         }
 
         [HttpGet]
@@ -73,25 +76,185 @@ namespace LocalRagAPI.Controllers
             if (string.IsNullOrWhiteSpace(question))
             {
                 await Response.WriteAsync("data: Question cannot be empty.\n\n");
+                await Response.Body.FlushAsync();
                 return;
             }
 
-            // Step 1 — Build RAG answer normally
-            var ragResponse = await AskRag(question, doc);
-
-            // Step 2 — Stream tokens instead of full text
-            var words = ragResponse.Answer.Split(" ");
-
-            foreach (var word in words)
+            if (!await _qdrant.HasPointsAsync(doc))
             {
-                await Response.WriteAsync($"data: {word} \n\n");
+                await Response.WriteAsync("data: No documents uploaded. Please upload a document first.\n\n");
                 await Response.Body.FlushAsync();
-                await Task.Delay(10);
+                return;
             }
 
+            var history = _memory.BuildConversationHistory();
+
+            // optional rewrite
+            string rewrittenQuestion = question;
+            bool needsRewrite = NeedsRewrite(question);
+
+            if (needsRewrite)
+            {
+                var contextualQuestion = $@"
+                    Conversation History:
+                    {history}
+
+                    User Question:
+                    {question}
+
+                    Rewrite the question so it is clear for document search.
+                    Return only the rewritten question.
+                ";
+
+                rewrittenQuestion = await _llm.GenerateResponse(contextualQuestion);
+            }
+
+            var queries = new List<string> { rewrittenQuestion };
+            var embeddings = await _embeddingService.GenerateEmbeddings(queries);
+
+            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc, 50));
+            var vectorResults = await Task.WhenAll(vectorTasks);
+            var vectorItems = vectorResults.SelectMany(r => r).ToList();
+
+            var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50);
+
+            var candidateItems = vectorItems
+                .Concat(keywordItems)
+                .Where(i => !string.IsNullOrWhiteSpace(i.Content) && i.Content.Length > 30)
+                .GroupBy(i => i.Content)
+                .Select(g => g.First())
+                .Take(60)
+                .ToList();
+
+            if (!candidateItems.Any())
+            {
+                await Response.WriteAsync("data: This question is outside the scope of the uploaded documents.\n\n");
+                await Response.Body.FlushAsync();
+                await Response.WriteAsync("data: [DONE]\n\n");
+                await Response.Body.FlushAsync();
+                return;
+            }
+
+            var candidateContents = candidateItems.Select(i => i.Content).ToList();
+            var rerankedChunks = await _reranker.Rerank(rewrittenQuestion, candidateContents);
+
+            if (!rerankedChunks.Any())
+            {
+                await Response.WriteAsync("data: I cannot find that information in the uploaded documents.\n\n");
+                await Response.Body.FlushAsync();
+                await Response.WriteAsync("data: [DONE]\n\n");
+                await Response.Body.FlushAsync();
+                return;
+            }
+
+            // build context
+            var contextBuilder = new StringBuilder();
+            int sourceIndex = 1;
+            foreach (var chunk in rerankedChunks.Take(4))
+            {
+                contextBuilder.AppendLine($"[Source {sourceIndex}]");
+                contextBuilder.AppendLine(chunk);
+                contextBuilder.AppendLine();
+                sourceIndex++;
+            }
+
+            var combinedContext = contextBuilder.ToString();
+            var prompt = _promptBuilder.BuildPrompt(combinedContext, history, question);
+
+            // stream LLM tokens directly
+            var builder = new StringBuilder();
+
+            await foreach (var token in _llm.StreamResponse(prompt))
+            {
+                if (string.IsNullOrEmpty(token))
+                    continue;
+
+                // append to accumulated answer
+                builder.Append(token);
+
+                // forward token as SSE (raw, client buffers)
+                await Response.WriteAsync($"data: {token}\n\n");
+                await Response.Body.FlushAsync();
+            }
+
+            // send done
+            // Before finishing, send a cleaned final payload so client can replace streamed partials
+            string CleanFormatting(string text)
+            {
+                if (string.IsNullOrEmpty(text)) return string.Empty;
+
+                // Normalize CRLF
+                var t = text.Replace("\r\n", "\n");
+
+                // Ensure headings are explicit
+                t = System.Text.RegularExpressions.Regex.Replace(t, "(^|\n)(Summary)(?!\\n)", "$1### Summary\n\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                t = System.Text.RegularExpressions.Regex.Replace(t, "(^|\n)(Key Points)(?!\\n)", "$1### Key Points\n\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                t = System.Text.RegularExpressions.Regex.Replace(t, "(^|\n)(Detailed Explanation)(?!\\n)", "$1### Detailed Explanation\n\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                t = System.Text.RegularExpressions.Regex.Replace(t, "(^|\n)(Sources)(?!\\n)", "$1### Sources\n\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                // Ensure a blank line before list items
+                t = System.Text.RegularExpressions.Regex.Replace(t, "\n- ", "\n\n- ");
+
+                // Collapse multiple blank lines
+                t = System.Text.RegularExpressions.Regex.Replace(t, "\n{3,}", "\n\n");
+
+                return t.Trim();
+            }
+
+            var finalClean = CleanFormatting(builder.ToString());
+
+            // send final cleaned as a single SSE event prefixed with [FINAL]
+            // write prefix line
+            await Response.WriteAsync("data: [FINAL]\n");
+
+            // write each line as data: to preserve newlines in event.data
+            foreach (var line in finalClean.Split('\n'))
+            {
+                await Response.WriteAsync($"data: {line}\n");
+            }
+
+            await Response.WriteAsync("\n");
+            await Response.Body.FlushAsync();
+
+            // send done
             await Response.WriteAsync("data: [DONE]\n\n");
             await Response.Body.FlushAsync();
+
+            // save memory with final assembled response
+            var finalAnswer = builder.ToString();
+            _memory.AddUserMessage(question);
+            _memory.AddAssistantMessage(finalAnswer);
         }
+
+        //[HttpGet("ask-rag-stream")]
+        //public async Task AskRagStream(string question, string doc = null)
+        //{
+        //    Response.ContentType = "text/event-stream";
+        //    Response.Headers.Add("Cache-Control", "no-cache");
+        //    Response.Headers.Add("Connection", "keep-alive");
+
+        //    if (string.IsNullOrWhiteSpace(question))
+        //    {
+        //        await Response.WriteAsync("data: Question cannot be empty.\n\n");
+        //        return;
+        //    }
+
+        //    // Step 1 — Build RAG answer normally
+        //    var ragResponse = await AskRag(question, doc);
+
+        //    // Step 2 — Stream tokens instead of full text
+        //    var words = ragResponse.Answer.Split(" ");
+
+        //    foreach (var word in words)
+        //    {
+        //        await Response.WriteAsync($"data: {word} \n\n");
+        //        await Response.Body.FlushAsync();
+        //        await Task.Delay(10);
+        //    }
+
+        //    await Response.WriteAsync("data: [DONE]\n\n");
+        //    await Response.Body.FlushAsync();
+        //}
         // working code
         //[HttpGet("ask-rag-stream")]
         //public async Task AskRagStream(string question, string doc = null)
@@ -123,6 +286,16 @@ namespace LocalRagAPI.Controllers
         [HttpGet("ask-rag")]
         public async Task<RagResponse> AskRag(string question,string doc = null)
         {
+
+            if (!await _qdrant.HasPointsAsync(doc))
+            {
+                return new RagResponse
+                {
+                    Answer = "No documents uploaded. Please upload a document first.",
+                    Sources = new List<string>()
+                };
+            }
+
             if (string.IsNullOrWhiteSpace(question))
             {
                 return new RagResponse
@@ -222,13 +395,12 @@ namespace LocalRagAPI.Controllers
             // =============================
 
 
-            // VECTOR SEARCH
-            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc));
+            // VECTOR SEARCH — retrieve larger candidate pool
+            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc, 50));
             var vectorResults = await Task.WhenAll(vectorTasks);
 
-            var vectorChunks = vectorResults
+            var vectorItems = vectorResults
                 .SelectMany(r => r)
-                .Distinct()
                 .ToList();
 
             // KEYWORD MATCHING (LOCAL)
@@ -237,7 +409,7 @@ namespace LocalRagAPI.Controllers
                 .Split(" ", StringSplitOptions.RemoveEmptyEntries);
 
 
-            var keywordChunks = await _qdrant.KeywordSearch(rewrittenQuestion, doc);
+            var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50);
             //working and also fast chage on 11.03.26 12;15
 
             //var keywordChunks = vectorChunks
@@ -248,12 +420,14 @@ namespace LocalRagAPI.Controllers
 
             // MERGE VECTOR + KEYWORD RESULTS
 
-            var candidateChunks = vectorChunks
-    .Concat(keywordChunks)
-    .Where(c => c.Length > 50)
-    .Distinct()
-    .Take(12)
-    .ToList();
+            // Merge vector + keyword results, filter tiny chunks and deduplicate by content
+            var candidateItems = vectorItems
+                .Concat(keywordItems)
+                .Where(i => !string.IsNullOrWhiteSpace(i.Content) && i.Content.Length > 30)
+                .GroupBy(i => i.Content)
+                .Select(g => g.First())
+                .Take(60)
+                .ToList();
             //old code working 11.03.26 12:22
 
             //var candidateChunks = vectorChunks
@@ -274,7 +448,7 @@ namespace LocalRagAPI.Controllers
             //    .Distinct()
             //    .ToList();
 
-            if (!candidateChunks.Any())
+            if (!candidateItems.Any())
             {
                 return new RagResponse
                 {
@@ -287,7 +461,9 @@ namespace LocalRagAPI.Controllers
             // STEP 6 — RERANK
             // =============================
 
-            var rerankedChunks = await _reranker.Rerank(rewrittenQuestion, candidateChunks);
+            var candidateContents = candidateItems.Select(i => i.Content).ToList();
+
+            var rerankedChunks = await _reranker.Rerank(rewrittenQuestion, candidateContents);
 
             if (!rerankedChunks.Any())
             {
@@ -301,6 +477,11 @@ namespace LocalRagAPI.Controllers
             // =============================
             // STEP 7 — CONTEXT BUILDING
             // =============================
+
+            // map content back to original search items for source metadata
+            var itemByContent = candidateItems
+                .GroupBy(i => i.Content)
+                .ToDictionary(g => g.Key, g => g.First());
 
             var contextBuilder = new StringBuilder();
 
@@ -321,92 +502,95 @@ namespace LocalRagAPI.Controllers
             // STEP 8 — FINAL PROMPT
             // =============================
 
-            var prompt = $@"You are an AI assistant that answers questions using the provided documents.
 
-Instructions:
-- Use ONLY the provided context to answer the question.
-- If the answer is not found in the context, respond exactly with:
-'I cannot find that information in the uploaded documents.'
-- Do not invent information.
+            var prompt = _promptBuilder.BuildPrompt(combinedContext, history, question);
 
-IMPORTANT:
-Always leave a blank line after headings.
-Never place headings and text on the same line.
+            //            var prompt = $@"You are an AI assistant that answers questions using the provided documents.
 
-When an answer exists, format the response using Markdown.
+            //Instructions:
+            //- Use ONLY the provided context to answer the question.
+            //- If the answer is not found in the context, respond exactly with:
+            //'I cannot find that information in the uploaded documents.'
+            //- Do not invent information.
 
-Structure:
+            //IMPORTANT:
+            //Always leave a blank line after headings.
+            //Never place headings and text on the same line.
 
-### Summary
-Short explanation of the answer.
+            //When an answer exists, format the response using Markdown.
 
-### Key Points
-- Important point
-- Important point
-- Important point
+            //Structure:
 
-### Detailed Explanation
-Provide a detailed explanation based only on the context.
+            //### Summary
+            //Short explanation of the answer.
 
-### Sources
-List the sources used such as:
-- [Source 1]
-- [Source 2]
+            //### Key Points
+            //- Important point
+            //- Important point
+            //- Important point
 
-Formatting rules:
-- Always leave a blank line after headings
-- Use bullet points with '-'
-- Never place headings inline with text
+            //### Detailed Explanation
+            //Provide a detailed explanation based only on the context.
 
-Context:
-{combinedContext}
+            //### Sources
+            //List the sources used such as:
+            //- [Source 1]
+            //- [Source 2]
 
-Conversation History:
-{history}
+            //Formatting rules:
+            //- Always leave a blank line after headings
+            //- Use bullet points with '-'
+            //- Never place headings inline with text
 
-Question:
-{question}";
+            //Context:
+            //{combinedContext}
 
-//            var prompt = $@"
-//You are an AI assistant for answering questions from company documents.
+            //Conversation History:
+            //{history}
 
-//Answer ONLY using the provided context.
+            //Question:
+            //{question}";
 
-//Use short paragraphs and bullet points when appropriate.
-//Avoid long walls of text.
+            //            var prompt = $@"
+            //You are an AI assistant for answering questions from company documents.
 
-//Format your answer EXACTLY like this:
+            //Answer ONLY using the provided context.
 
-//### Summary
-//Provide a short 2-3 sentence summary.
+            //Use short paragraphs and bullet points when appropriate.
+            //Avoid long walls of text.
 
-//### Key Points
-//- Bullet point
-//- Bullet point
-//- Bullet point
+            //Format your answer EXACTLY like this:
 
-//### Detailed Explanation
-//Explain clearly using paragraphs.
+            //### Summary
+            //Provide a short 2-3 sentence summary.
 
-//### Sources
-//Cite sources like [Source 1].
+            //### Key Points
+            //- Bullet point
+            //- Bullet point
+            //- Bullet point
 
-//Rules:
-//- Use bullet points when possible
-//- Do NOT generate information not present in context
-//- If the answer is not in the context say:
+            //### Detailed Explanation
+            //Explain clearly using paragraphs.
 
-//'I cannot find that information in the uploaded documents.'
+            //### Sources
+            //Cite sources like [Source 1].
 
-//Context:
-//{combinedContext}
+            //Rules:
+            //- Use bullet points when possible
+            //- Do NOT generate information not present in context
+            //- If the answer is not in the context say:
 
-//Conversation History:
-//{history}
+            //'I cannot find that information in the uploaded documents.'
 
-//Question:
-//{question}
-//";
+            //Context:
+            //{combinedContext}
+
+            //Conversation History:
+            //{history}
+
+            //Question:
+            //{question}
+            //";
 
 
             //working code 09/03/2026
@@ -457,11 +641,20 @@ Question:
 
             var sources = new List<string>();
 
-            if (!response.Contains("I cannot find", StringComparison.OrdinalIgnoreCase))
+            // Use the reranked chunks and original search metadata for better source display
+            if (rerankedChunks != null && rerankedChunks.Any())
             {
-                sources = Enumerable
-                    .Repeat("📄 Uploaded Document", 3)
-                    .ToList();
+                foreach (var c in rerankedChunks.Take(3))
+                {
+                    if (itemByContent != null && itemByContent.TryGetValue(c, out var item) && !string.IsNullOrEmpty(item.Document))
+                    {
+                        sources.Add($"📄 {item.Document}");
+                    }
+                    else
+                    {
+                        sources.Add("📄 Uploaded Document");
+                    }
+                }
             }
 
             return new RagResponse
@@ -752,20 +945,48 @@ Assistant:
         private async Task ProcessDocument(string text, string documentName)
         {
 
-            var words = text.Split(" ", StringSplitOptions.RemoveEmptyEntries);
+            var sentences = text
+    .Split(new[] { ".", "!", "?" }, StringSplitOptions.RemoveEmptyEntries)
+    .Select(s => s.Trim())
+    .Where(s => !string.IsNullOrWhiteSpace(s))
+    .ToList();
 
-            int chunkSize = 250;
-            int overlap = 50;
+            int chunkSentenceSize = 6;
+            int overlap = 2;
+            int maxChunks = 300;
 
             var chunks = new List<string>();
 
-            for (int i = 0; i < words.Length; i += chunkSize - overlap)
+            for (int i = 0; i < sentences.Count; i += (chunkSentenceSize - overlap))
             {
-                var chunkWords = words.Skip(i).Take(chunkSize);
-                var chunkText = string.Join(" ", chunkWords);
+                var chunkSentences = sentences
+                    .Skip(i)
+                    .Take(chunkSentenceSize)
+                    .ToList();
 
+                if (!chunkSentences.Any())
+                    break;
+
+                var chunkText = string.Join(". ", chunkSentences) + ".";
                 chunks.Add(chunkText);
+
+                if (chunks.Count >= maxChunks)
+                    break;
             }
+            //var words = text.Split(" ", StringSplitOptions.RemoveEmptyEntries);
+
+            //int chunkSize = 250;
+            //int overlap = 50;
+
+            //var chunks = new List<string>();
+
+            //for (int i = 0; i < words.Length; i += chunkSize - overlap)
+            //{
+            //    var chunkWords = words.Skip(i).Take(chunkSize);
+            //    var chunkText = string.Join(" ", chunkWords);
+
+            //    chunks.Add(chunkText);
+            //}
 
             //by sentence
 
@@ -798,15 +1019,33 @@ Assistant:
             //    chunks.Add(chunkText);
             //}
 
-            var embeddings = await _embeddingService.GenerateEmbeddings(chunks);
+            // Batch embedding requests to avoid huge payloads and improve throughput
+            int batchSize = 100;
 
-            for (int i = 0; i < chunks.Count; i++)
+            for (int i = 0; i < chunks.Count; i += batchSize)
             {
-                await _qdrant.InsertChunk(
-                    documentName,
-                    chunks[i],
-                    embeddings[i]
-                );
+                var batch = chunks.Skip(i).Take(batchSize).ToList();
+                var embBatch = await _embeddingService.GenerateEmbeddings(batch);
+
+                // prepare batch points for upsert
+                var points = new List<Qdrant.Client.Grpc.PointStruct>();
+
+                for (int j = 0; j < embBatch.Count; j++)
+                {
+                    var point = new Qdrant.Client.Grpc.PointStruct
+                    {
+                        Id = new Qdrant.Client.Grpc.PointId { Uuid = Guid.NewGuid().ToString() },
+                        Vectors = embBatch[j]
+                    };
+
+                    point.Payload.Add("document", documentName);
+                    point.Payload.Add("content", batch[j]);
+
+                    points.Add(point);
+                }
+
+                // batch upsert to Qdrant
+                await _qdrant.BatchUpsertAsync(points);
             }
         }
 

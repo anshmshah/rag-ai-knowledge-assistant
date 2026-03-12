@@ -16,6 +16,7 @@
     <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
 
     <link rel="stylesheet" href="styles.css">
+    <!-- Removed github-markdown-css to avoid nested bubble styling conflicts -->
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -159,23 +160,28 @@
 
                 <template x-for="(msg, index) in messages" :key="index">
 
-                    <div :class="msg.role==='user' ? 'text-right':''">
+                    <div :class="msg.role==='user' ? 'text-right message-row':''">
 
                         <div :class="msg.role==='user' ? 'user-bubble' : 'ai-bubble'">
 
                             <!-- MESSAGE -->
+                            <div class="message-body">
+                                <div class="markdown-body prose" x-html="renderMessage(msg.content)"></div>
 
-                            <div class="prose prose-invert max-w-none" x-html="renderMessage(msg.content)"></div>
-                            <!--<div x-html="renderMessage(msg.content)"></div>-->
+                                <div class="msg-meta mt-2 flex items-center gap-2">
+                                    <template x-if="msg.timestamp">
+                                        <span class="text-xs text-gray-400" x-text="(new Date(msg.timestamp)).toLocaleTimeString()"></span>
+                                    </template>
 
-                            <!-- SOURCES -->
-                            <template x-if="msg.sources && msg.sources.length > 0">
-                                <div class="mt-2 flex gap-2 flex-wrap">
-                                    <template x-for="s in msg.sources">
-                                        <span class="source-badge" x-text="s"></span>
+                                    <template x-if="msg.sources && msg.sources.length > 0">
+                                        <div class="flex gap-2">
+                                            <template x-for="s in msg.sources">
+                                                <span class="source-badge" @click="selectDocument(s)" x-text="s"></span>
+                                            </template>
+                                        </div>
                                     </template>
                                 </div>
-                            </template>
+                            </div>
 
                         </div>
 

@@ -50,7 +50,26 @@
 
         renderMessage(text) {
             if (!text) return ""
-            return marked.parse(text.replace(/\n/g, "\n\n"))
+            // Work on a copy
+            let t = String(text);
+
+            // Normalize Windows CRLF
+            t = t.replace(/\r\n/g, "\n");
+
+            // Ensure blank line before and after headings (##, ###, etc.)
+            t = t.replace(/(^|\n)(#{2,6} .*?)\n*/g, (m, p1, p2) => `${p1}${p2}\n\n`);
+
+            // Ensure lists have a blank line before and after block
+            t = t.replace(/\n(\s*-\s+)/g, (m, p1) => `\n\n${p1}`);
+            t = t.replace(/(\n\s*\n)(- .*?)(\n\s*\n|$)/gs, (m, p1, p2, p3) => `\n${p2}${p3}`);
+
+            // Collapse multiple blank lines to max two
+            t = t.replace(/\n{3,}/g, "\n\n");
+
+            // Trim leading/trailing whitespace
+            t = t.trim();
+
+            return marked.parse(t);
         },
 
         clearChat() {
@@ -117,38 +136,98 @@
 
                     this.thinking = true
 
-                    eventSource.onmessage = (event) => {
+                    // Buffered streaming to preserve markdown and reduce re-renders
+                    let buffer = ""
+                    let flushTimer = null
 
-                        console.log("STREAM:", event.data)
+                    const flushBuffer = () => {
+                        if (!buffer) return
+
+                        // Safe join: ensure space between existing content and buffer when needed
+                        const curr = this.messages[lastIndex].content || "";
+                        if (curr.length > 0) {
+                            const lastChar = curr[curr.length - 1];
+                            const firstChar = buffer[0];
+                            if (!/\s/.test(lastChar) && firstChar && !/\s/.test(firstChar) && !/^\n/.test(buffer)) {
+                                this.messages[lastIndex].content += " " + buffer;
+                            } else {
+                                this.messages[lastIndex].content += buffer;
+                            }
+                        } else {
+                            this.messages[lastIndex].content += buffer;
+                        }
+
+                        buffer = ""
+                        this.messages = [...this.messages]
+                        this.scrollBottom()
+                    }
+
+                    eventSource.onmessage = (event) => {
+                        // console.log("STREAM:", event.data)
 
                         if (event.data === "[DONE]") {
+                            // flush remaining buffer and finalize
+                            if (flushTimer) clearTimeout(flushTimer)
+                            flushBuffer()
                             this.thinking = false
                             eventSource.close()
 
-                            
-                            console.log(this.messages[lastIndex].content)
                             // Save in RAG history
                             this.ragHistory.push({
                                 role: "assistant",
-                                content: this.messages[lastIndex].content
+                                content: this.messages[lastIndex].content,
+                                timestamp: Date.now(),
+                                sources: this.messages[lastIndex].sources || []
                             })
-
-                            // Force Alpine refresh
-                            this.messages = [...this.messages]
 
                             return
                         }
 
-                        // Append streamed token
-                        this.messages[lastIndex].content += event.data 
+                        // FINAL cleaned payload arrives prefixed with [FINAL]\n<content>
+                        if (event.data.startsWith("[FINAL]")) {
+                            // flush any buffer
+                            if (flushTimer) clearTimeout(flushTimer)
+                            flushBuffer()
 
-                        // Refresh UI
-                        this.messages = [...this.messages]
+                            // Extract final content (may include newlines)
+                            const final = event.data.replace(/^\[FINAL\]\n?/, "");
 
-                        this.scrollBottom()
+                            // Replace message content entirely with final cleaned text
+                            this.messages[lastIndex].content = final
+
+                            // Refresh UI and save history
+                            this.messages = [...this.messages]
+                            this.ragHistory.push({ role: "assistant", content: final, timestamp: Date.now() })
+
+                            return
+                        }
+
+                        // Accumulate incoming fragments
+                        const token = event.data || "";
+
+                        // If token starts with newline, keep as-is. Otherwise ensure token spacing
+                        if (!token) return;
+
+                        if (buffer.length === 0 && this.messages[lastIndex].content && this.messages[lastIndex].content.length > 0) {
+                            const lastChar = this.messages[lastIndex].content.slice(-1);
+                            const firstChar = token[0];
+                            if (!/\s/.test(lastChar) && !/\s/.test(firstChar) && !/^\n/.test(token)) {
+                                buffer += " " + token;
+                            } else {
+                                buffer += token;
+                            }
+                        } else {
+                            buffer += token;
+                        }
+
+                        // Debounce flush to update UI smoothly
+                        if (flushTimer) clearTimeout(flushTimer)
+                        flushTimer = setTimeout(flushBuffer, 80)
                     }
 
                     eventSource.onerror = () => {
+                        if (flushTimer) clearTimeout(flushTimer)
+                        flushBuffer()
                         eventSource.close()
                     }
 
