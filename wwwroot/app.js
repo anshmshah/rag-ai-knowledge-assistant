@@ -7,7 +7,6 @@
         question: "",
         messages: [],
         documents: [],
-        ingestionJobs: [],
         selectedDoc: "",
         thinking: false,
         uploading: false,
@@ -233,74 +232,6 @@
                     }
 
                 }
-
-        ,
-
-        // ================================
-        // INGEST POLLING
-        // ================================
-
-        startIngestPolling(jobId, fileName) {
-            if (!jobId) return;
-
-            const existing = this.ingestionJobs.find(j => j.jobId === jobId);
-            if (existing) return;
-
-            const job = {
-                jobId,
-                fileName,
-                state: 'Queued',
-                completedBatches: 0,
-                totalBatches: 0,
-                error: null,
-                timer: null
-            };
-
-            this.ingestionJobs.push(job);
-
-            const mapState = (s) => {
-                // handle numeric enum or string
-                const names = ['Queued','Processing','Completed','Failed'];
-                if (typeof s === 'number') return names[s] ?? s;
-                return s;
-            };
-
-            const poll = async () => {
-                try {
-                    const res = await fetch(`/api/AITest/ingest-status?jobId=${encodeURIComponent(jobId)}`);
-                    if (!res.ok) {
-                        return;
-                    }
-                    const data = await res.json();
-                    const state = mapState(data.state ?? data.State);
-                    job.state = state;
-                    job.completedBatches = data.completedBatches ?? data.CompletedBatches ?? 0;
-                    job.totalBatches = data.totalBatches ?? data.TotalBatches ?? 0;
-                    job.error = data.error ?? data.Error ?? null;
-
-                    // update UI
-                    this.ingestionJobs = [...this.ingestionJobs];
-
-                    if (state === 'Completed') {
-                        if (!this.documents.includes(fileName)) this.documents.push(fileName);
-                        if (job.timer) clearInterval(job.timer);
-                        job.timer = null;
-                    }
-
-                    if (state === 'Failed') {
-                        if (job.timer) clearInterval(job.timer);
-                        job.timer = null;
-                    }
-                }
-                catch (err) {
-                    console.error('Poll error', err);
-                }
-            };
-
-            // start immediate poll and set interval
-            poll();
-            job.timer = setInterval(poll, 2000);
-        }
 
                 // ========================
                 // GENERAL CHAT
@@ -550,27 +481,16 @@
                     body: formData
                 })
 
-                this.uploadProgress = 40
-                this.uploadMessage = "Queued for indexing..."
+                this.uploadProgress = 70
+                this.uploadMessage = "Processing document..."
 
-                if (res.status === 202) {
-                    // expected JSON { jobId }
-                    const data = await res.json();
-                    const jobId = data.jobId || data.jobid || data.JobId;
-                    if (jobId) {
-                        this.startIngestPolling(jobId, file.name);
-                        this.uploadProgress = 60
-                        this.uploadMessage = "Indexing started..."
-                    } else {
-                        const text = await res.text();
-                        this.uploadProgress = 100
-                        this.uploadMessage = text
-                    }
-                }
-                else {
-                    const text = await res.text();
-                    this.uploadProgress = 100
-                    this.uploadMessage = text
+                const text = await res.text()
+
+                this.uploadProgress = 100
+                this.uploadMessage = text
+
+                if (!this.documents.includes(file.name)) {
+                    this.documents.push(file.name)
                 }
 
             }
@@ -603,22 +523,14 @@
             formData.append("file", file)
 
             try {
-                const res = await fetch("/api/AITest/upload", {
+
+                await fetch("/api/AITest/upload", {
                     method: "POST",
                     body: formData
                 })
 
-                if (res.status === 202) {
-                    const data = await res.json();
-                    const jobId = data.jobId || data.jobid || data.JobId;
-                    if (jobId) {
-                        this.startIngestPolling(jobId, file.name);
-                    }
-                } else {
-                    // fallback: add document immediately if server returned success
-                    if (!this.documents.includes(file.name)) {
-                        this.documents.push(file.name)
-                    }
+                if (!this.documents.includes(file.name)) {
+                    this.documents.push(file.name)
                 }
 
             }
