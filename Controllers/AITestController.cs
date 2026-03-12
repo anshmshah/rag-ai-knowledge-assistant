@@ -51,6 +51,21 @@ namespace LocalRagAPI.Controllers
             _logger = logger;
         }
 
+        [HttpGet("ingest-status")]
+        public IActionResult IngestStatus(string jobId)
+        {
+            if (string.IsNullOrEmpty(jobId)) return BadRequest(new { error = "jobId is required" });
+
+            var jobStore = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.IngestionJobStore)) as LocalRagAPI.Services.IngestionJobStore;
+
+            if (jobStore == null) return StatusCode(500);
+
+            if (!jobStore.TryGet(jobId, out var status))
+                return NotFound(new { error = "job not found" });
+
+            return Ok(status);
+        }
+
         [HttpGet]
         public async Task<string> Ask()
         {
@@ -891,7 +906,7 @@ Assistant:
         // FILE UPLOAD
         // =========================
         [HttpPost("upload")]
-        public async Task<string> UploadFile(IFormFile file)
+        public async Task<ActionResult<string>> UploadFile(IFormFile file)
         {
             if (file == null || file.Length == 0)
                 return "Invalid file.";
@@ -933,16 +948,43 @@ Assistant:
                 return $"Error reading file: {ex.Message}";
             }
 
-            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-            _logger?.LogInformation("Starting upload processing for {FileName} size={Size}", file.FileName, file.Length);
+            // Enqueue ingestion job and return 202 with jobId
+            var jobId = Guid.NewGuid().ToString();
 
-            await ProcessDocument(text, file.FileName);
+            var job = new LocalRagAPI.Models.IngestionJobStatus
+            {
+                JobId = jobId,
+                State = LocalRagAPI.Models.IngestionJobState.Queued,
+                CreatedAt = DateTime.UtcNow,
+                CompletedBatches = 0,
+                TotalBatches = 0
+            };
 
-            stopwatch.Stop();
+            // add to job store
+            var jobStore = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.IngestionJobStore)) as LocalRagAPI.Services.IngestionJobStore;
+            var queue = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.DocumentIngestionQueue)) as LocalRagAPI.Services.DocumentIngestionQueue;
 
-            _logger?.LogInformation("Finished processing {FileName} in {Elapsed}ms", file.FileName, stopwatch.ElapsedMilliseconds);
+            jobStore?.AddJob(job);
 
-            return $"File processed successfully in {stopwatch.ElapsedMilliseconds} ms";
+            var request = new LocalRagAPI.Models.DocumentIngestionRequest
+            {
+                JobId = jobId,
+                DocumentName = file.FileName,
+                Text = text,
+                FileName = file.FileName
+            };
+
+            // try enqueue with short timeout
+            var enqueued = await queue.EnqueueAsync(request, TimeSpan.FromSeconds(5));
+
+            if (!enqueued)
+            {
+                jobStore?.MarkFailed(jobId, "Queue is full");
+                return StatusCode(429, "Server busy, try again later.");
+            }
+
+            // return 202 with job id
+            return Accepted(new { jobId });
         }
 
         // =========================

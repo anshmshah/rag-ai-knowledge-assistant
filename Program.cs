@@ -23,6 +23,11 @@ builder.Services.AddHttpClient<JinaRerankerService>()
 
 builder.Services.AddSingleton<QdrantService>();
 builder.Services.AddSingleton<PromptBuilderService>();
+// Ingestion queue and job store for background processing
+builder.Services.AddSingleton<LocalRagAPI.Services.DocumentIngestionQueue>();
+builder.Services.AddSingleton<LocalRagAPI.Services.IngestionJobStore>();
+builder.Services.AddScoped<LocalRagAPI.Services.DocumentProcessor>();
+builder.Services.AddHostedService<LocalRagAPI.Services.DocumentIngestionWorker>();
 
 ModelTestService.TestModel();
 var app = builder.Build();
