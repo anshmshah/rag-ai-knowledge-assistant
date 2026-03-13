@@ -1,5 +1,6 @@
 ﻿using Qdrant.Client;
 using Qdrant.Client.Grpc;
+using Microsoft.Extensions.Configuration;
 
 namespace LocalRagAPI.Services
 {
@@ -8,12 +9,21 @@ namespace LocalRagAPI.Services
         private readonly QdrantClient _client;
         private const string COLLECTION = "documents";
         private readonly Microsoft.Extensions.Logging.ILogger<QdrantService> _logger;
+        private readonly bool _recreateOnStartup;
 
-        public QdrantService(Microsoft.Extensions.Logging.ILogger<QdrantService> logger)
+        public QdrantService(Microsoft.Extensions.Logging.ILogger<QdrantService> logger, IConfiguration config)
         {
             _logger = logger;
             AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
-            _client = new QdrantClient("localhost", 6334);
+
+            // Read optional configuration for Qdrant connection and startup behavior
+            var host = config["Qdrant:Host"] ?? "localhost";
+            var port = 6334;
+            if (int.TryParse(config["Qdrant:Port"], out var p)) port = p;
+
+            _recreateOnStartup = config.GetValue<bool>("Qdrant:RecreateOnStartup", false);
+
+            _client = new QdrantClient(host, port);
         }
 
         // =========================
@@ -26,16 +36,35 @@ namespace LocalRagAPI.Services
 
             if (collections.Contains(COLLECTION))
             {
-                await _client.DeleteCollectionAsync(COLLECTION);
-            }
-
-            await _client.CreateCollectionAsync(
-                COLLECTION,
-                new VectorParams
+                if (_recreateOnStartup)
                 {
-                    Size = 768,
-                    Distance = Distance.Cosine
-                });
+                    _logger?.LogWarning("Qdrant collection '{Collection}' exists and will be recreated because Qdrant:RecreateOnStartup=true", COLLECTION);
+                    await _client.DeleteCollectionAsync(COLLECTION);
+
+                    await _client.CreateCollectionAsync(
+                        COLLECTION,
+                        new VectorParams
+                        {
+                            Size = 768,
+                            Distance = Distance.Cosine
+                        });
+                }
+                else
+                {
+                    _logger?.LogInformation("Qdrant collection '{Collection}' already exists; skipping creation.", COLLECTION);
+                }
+            }
+            else
+            {
+                _logger?.LogInformation("Qdrant collection '{Collection}' does not exist and will be created.", COLLECTION);
+                await _client.CreateCollectionAsync(
+                    COLLECTION,
+                    new VectorParams
+                    {
+                        Size = 768,
+                        Distance = Distance.Cosine
+                    });
+            }
         }
 
         // =========================
