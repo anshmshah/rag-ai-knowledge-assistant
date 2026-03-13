@@ -67,8 +67,22 @@ namespace LocalRagAPI.Services
                         Id = new Qdrant.Client.Grpc.PointId { Uuid = Guid.NewGuid().ToString() },
                         Vectors = embBatch[j]
                     };
+
+                    // core payload
                     point.Payload.Add("document", documentName);
                     point.Payload.Add("content", batch[j]);
+
+                    // attach ownership metadata when available
+                    if (request.UserId.HasValue)
+                    {
+                        point.Payload.Add("user_id", request.UserId.Value.ToString());
+                    }
+
+                    if (request.DocumentId.HasValue)
+                    {
+                        point.Payload.Add("document_id", request.DocumentId.Value.ToString());
+                    }
+
                     points.Add(point);
                 }
 

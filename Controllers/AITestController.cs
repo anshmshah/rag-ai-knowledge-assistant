@@ -18,6 +18,8 @@ using static Google.Protobuf.WellKnownTypes.Field.Types;
 using static System.Net.Mime.MediaTypeNames;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 using static UglyToad.PdfPig.Core.PdfSubpath;
+using LocalRagAPI.Repositories;
+using Microsoft.AspNetCore.Hosting;
 
 namespace LocalRagAPI.Controllers
 {
@@ -32,6 +34,11 @@ namespace LocalRagAPI.Controllers
         private readonly QdrantService _qdrant;
         private readonly PromptBuilderService _promptBuilder;
         private readonly Microsoft.Extensions.Logging.ILogger<AITestController> _logger;
+        private readonly IDocumentRepository _documentRepository;
+        private readonly IWebHostEnvironment _env;
+        private readonly IChatSessionRepository _chatSessionRepository;
+        private readonly IMessageRepository _messageRepository;
+        private readonly IQueryLogRepository _queryLogRepository;
 
         public AITestController(
             ILLMService llm,
@@ -40,7 +47,12 @@ namespace LocalRagAPI.Controllers
             JinaRerankerService reranker,
             QdrantService qdrant,
             PromptBuilderService promptBuilder,
-            Microsoft.Extensions.Logging.ILogger<AITestController> logger)
+            Microsoft.Extensions.Logging.ILogger<AITestController> logger,
+            IDocumentRepository documentRepository,
+            IWebHostEnvironment env,
+            IChatSessionRepository chatSessionRepository,
+            IMessageRepository messageRepository,
+            IQueryLogRepository queryLogRepository)
         {
             _llm = llm;
             _embeddingService = embeddingService;
@@ -49,6 +61,24 @@ namespace LocalRagAPI.Controllers
             _qdrant = qdrant;
             _promptBuilder = promptBuilder;
             _logger = logger;
+            _documentRepository = documentRepository;
+            _env = env;
+            _chatSessionRepository = chatSessionRepository;
+            _messageRepository = messageRepository;
+            _queryLogRepository = queryLogRepository;
+        }
+
+        private Guid GetCurrentUserId()
+        {
+            if (User?.Identity?.IsAuthenticated == true)
+            {
+                var sub = User.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+                          ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+
+                if (Guid.TryParse(sub, out var parsed)) return parsed;
+            }
+
+            return Guid.Empty;
         }
 
         [HttpGet("ingest-status")]
@@ -85,7 +115,7 @@ namespace LocalRagAPI.Controllers
 
 
         [HttpGet("ask-rag-stream")]
-        public async Task AskRagStream(string question, string doc = null)
+        public async Task AskRagStream(string question, string doc = null, string sessionId = null)
         {
             Response.ContentType = "text/event-stream";
             Response.Headers.Add("Cache-Control", "no-cache");
@@ -98,7 +128,9 @@ namespace LocalRagAPI.Controllers
                 return;
             }
 
-            if (!await _qdrant.HasPointsAsync(doc))
+            var currentUserId = GetCurrentUserId();
+
+            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
             {
                 await Response.WriteAsync("data: No documents uploaded. Please upload a document first.\n\n");
                 await Response.Body.FlushAsync();
@@ -129,12 +161,13 @@ namespace LocalRagAPI.Controllers
 
             var queries = new List<string> { rewrittenQuestion };
             var embeddings = await _embeddingService.GenerateEmbeddings(queries);
+            var userIdStr = currentUserId == Guid.Empty ? null : currentUserId.ToString();
 
-            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc, 50));
+            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc, 50, userIdStr));
             var vectorResults = await Task.WhenAll(vectorTasks);
             var vectorItems = vectorResults.SelectMany(r => r).ToList();
 
-            var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50);
+            var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50, userIdStr);
 
             var candidateItems = vectorItems
                 .Concat(keywordItems)
@@ -178,6 +211,30 @@ namespace LocalRagAPI.Controllers
 
             var combinedContext = contextBuilder.ToString();
             var prompt = _promptBuilder.BuildPrompt(combinedContext, history, question);
+
+            // --- Session & persistence: determine or create session
+            ChatSession session = null;
+            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sid))
+            {
+                session = await _chatSessionRepository.GetByIdAsync(sid);
+            }
+
+            if (session == null)
+            {
+                session = await _chatSessionRepository.CreateAsync(new ChatSession
+                {
+                    UserId = currentUserId,
+                    Title = "Chat",
+                    ExpiresAt = DateTime.UtcNow.AddDays(30)
+                });
+            }
+
+            // persist user message
+            try
+            {
+                await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "user", Content = question });
+            }
+            catch { }
 
             // stream LLM tokens directly
             var builder = new StringBuilder();
@@ -240,6 +297,29 @@ namespace LocalRagAPI.Controllers
 
             // save memory with final assembled response
             var finalAnswer = builder.ToString();
+            // persist assistant message and query log
+            try
+            {
+                // attempt to map source document to a stored Document
+                LocalRagAPI.Models.Document mappedDoc = null;
+                var topSource = candidateItems.FirstOrDefault(ci => rerankedChunks.Take(4).Contains(ci.Content) && !string.IsNullOrEmpty(ci.Document));
+                if (topSource != null)
+                {
+                    mappedDoc = await _documentRepository.GetByFileNameAsync(topSource.Document);
+                }
+
+                await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "assistant", Content = finalAnswer });
+
+                await _queryLogRepository.CreateAsync(new QueryLog
+                {
+                    UserId = currentUserId,
+                    DocumentId = mappedDoc?.Id,
+                    Question = question,
+                    Answer = finalAnswer
+                });
+            }
+            catch { }
+
             _memory.AddUserMessage(question);
             _memory.AddAssistantMessage(finalAnswer);
         }
@@ -254,12 +334,55 @@ namespace LocalRagAPI.Controllers
 
             try
             {
-                await _qdrant.DeleteByDocumentAsync(name);
+                // support deleting by id or by filename
+                LocalRagAPI.Models.Document doc = null;
 
-                return Ok(new
+                if (Guid.TryParse(name, out var id))
                 {
-                    message = $"Document '{name}' deleted successfully."
-                });
+                    doc = await _documentRepository.GetByIdAsync(id);
+                }
+                else
+                {
+                    doc = await _documentRepository.GetByFileNameAsync(name);
+                }
+
+                if (doc == null)
+                    return NotFound(new { error = "Document not found" });
+
+                // if auth enabled, ensure ownership
+                if (User?.Identity?.IsAuthenticated == true)
+                {
+                    var sub = User.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+                              ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+
+                    if (!Guid.TryParse(sub, out var uid) || uid != doc.UserId)
+                    {
+                        return Forbid();
+                    }
+                }
+
+                // remove payloads from Qdrant scoped to this user
+                try
+                {
+                    await _qdrant.DeleteByDocumentAndUserAsync(doc.FileName, doc.UserId.ToString());
+                }
+                catch
+                {
+                    // fallback to broad delete
+                    await _qdrant.DeleteByDocumentAsync(doc.FileName);
+                }
+
+                // soft-delete record and remove file
+                await _documentRepository.MarkDeletedAsync(doc.Id);
+
+                try
+                {
+                    if (!string.IsNullOrEmpty(doc.FilePath) && System.IO.File.Exists(doc.FilePath))
+                        System.IO.File.Delete(doc.FilePath);
+                }
+                catch { }
+
+                return Ok(new { message = $"Document '{name}' deleted successfully." });
             }
             catch (Exception ex)
             {
@@ -275,10 +398,12 @@ namespace LocalRagAPI.Controllers
         // =========================
 
         [HttpGet("ask-rag")]
-        public async Task<RagResponse> AskRag(string question,string doc = null)
+        public async Task<RagResponse> AskRag(string question, string doc = null, string sessionId = null)
         {
 
-            if (!await _qdrant.HasPointsAsync(doc))
+            var currentUserId = GetCurrentUserId();
+
+            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
             {
                 return new RagResponse
                 {
@@ -370,8 +495,10 @@ namespace LocalRagAPI.Controllers
             // =============================
 
 
+            var userIdStr = currentUserId == Guid.Empty ? null : currentUserId.ToString();
+
             // VECTOR SEARCH — retrieve larger candidate pool
-            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc, 50));
+            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc, 50, userIdStr));
             var vectorResults = await Task.WhenAll(vectorTasks);
 
             var vectorItems = vectorResults
@@ -384,7 +511,7 @@ namespace LocalRagAPI.Controllers
                 .Split(" ", StringSplitOptions.RemoveEmptyEntries);
 
 
-            var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50);
+            var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50, userIdStr);
             
 
             // Merge vector + keyword results, filter tiny chunks and deduplicate by content
@@ -456,6 +583,26 @@ namespace LocalRagAPI.Controllers
 
             
 
+            // session handling and persistence
+            ChatSession session = null;
+            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sid))
+            {
+                session = await _chatSessionRepository.GetByIdAsync(sid);
+            }
+
+            if (session == null)
+            {
+                session = await _chatSessionRepository.CreateAsync(new ChatSession
+                {
+                    UserId = currentUserId,
+                    Title = "Chat",
+                    ExpiresAt = DateTime.UtcNow.AddDays(30)
+                });
+            }
+
+            try { await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "user", Content = question }); } catch { }
+
+
             //var prompt = $@"
             //    You are an AI assistant for answering questions from company documents.
 
@@ -490,8 +637,31 @@ namespace LocalRagAPI.Controllers
             
 
             // =============================
-            // STEP 9 — SAVE MEMORY
+            // STEP 9 — SAVE MEMORY AND PERSIST
             // =============================
+
+            // persist assistant message and query log
+            try
+            {
+                LocalRagAPI.Models.Document mappedDoc = null;
+                // try to find a matching source document
+                var topSource = candidateItems.FirstOrDefault(ci => rerankedChunks.Take(4).Contains(ci.Content) && !string.IsNullOrEmpty(ci.Document));
+                if (topSource != null)
+                {
+                    mappedDoc = await _documentRepository.GetByFileNameAsync(topSource.Document);
+                }
+
+                await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "assistant", Content = response });
+
+                await _queryLogRepository.CreateAsync(new QueryLog
+                {
+                    UserId = currentUserId,
+                    DocumentId = mappedDoc?.Id,
+                    Question = question,
+                    Answer = response
+                });
+            }
+            catch { }
 
             _memory.AddUserMessage(question);
             _memory.AddAssistantMessage(response);
@@ -606,7 +776,7 @@ Assistant:
                 return $"Error reading file: {ex.Message}";
             }
 
-            // Enqueue ingestion job and return 202 with jobId
+            // Create ingestion job metadata
             var jobId = Guid.NewGuid().ToString();
 
             var job = new LocalRagAPI.Models.IngestionJobStatus
@@ -618,18 +788,60 @@ Assistant:
                 TotalBatches = 0
             };
 
-            // add to job store
             var jobStore = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.IngestionJobStore)) as LocalRagAPI.Services.IngestionJobStore;
             var queue = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.DocumentIngestionQueue)) as LocalRagAPI.Services.DocumentIngestionQueue;
 
             jobStore?.AddJob(job);
+
+            // Determine user ownership. If authenticated use claim, otherwise use Guid.Empty as "local" user
+            Guid finalUserId = Guid.Empty;
+            if (User?.Identity?.IsAuthenticated == true)
+            {
+                var sub = User.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+                          ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+
+                if (Guid.TryParse(sub, out var parsed)) finalUserId = parsed;
+            }
+
+            // Persist file on disk under /uploads/{userId}/{documentId}.{ext}
+            var docEntity = new LocalRagAPI.Models.Document
+            {
+                UserId = finalUserId,
+                FileName = file.FileName
+            };
+
+            var uploadsRoot = Path.Combine(_env.ContentRootPath, "uploads");
+            var userFolder = Path.Combine(uploadsRoot, finalUserId.ToString());
+            Directory.CreateDirectory(userFolder);
+
+            var ext = Path.GetExtension(file.FileName) ?? string.Empty;
+            var diskFileName = docEntity.Id.ToString() + ext;
+            var diskPath = Path.Combine(userFolder, diskFileName);
+
+            try
+            {
+                await using (var fs = new FileStream(diskPath, FileMode.Create))
+                {
+                    await file.CopyToAsync(fs);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to save uploaded file");
+                return StatusCode(500, "Failed to save uploaded file");
+            }
+
+            docEntity.FilePath = diskPath;
+            await _documentRepository.CreateAsync(docEntity);
 
             var request = new LocalRagAPI.Models.DocumentIngestionRequest
             {
                 JobId = jobId,
                 DocumentName = file.FileName,
                 Text = text,
-                FileName = file.FileName
+                FileName = file.FileName,
+                DocumentId = docEntity.Id,
+                UserId = docEntity.UserId
             };
 
             // try enqueue with short timeout
@@ -641,8 +853,8 @@ Assistant:
                 return StatusCode(429, "Server busy, try again later.");
             }
 
-            // return 202 with job id
-            return Accepted(new { jobId });
+            // return 202 with job id and document id
+            return Accepted(new { jobId, documentId = docEntity.Id });
         }
 
         private async Task ProcessDocument(string text, string documentName)

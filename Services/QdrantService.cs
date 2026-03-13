@@ -68,7 +68,7 @@ namespace LocalRagAPI.Services
             return await Search(embedding, documentFilter, 20);
         }
 
-        public async Task<List<LocalRagAPI.Models.SearchResultItem>> Search(float[] embedding, string documentFilter = null, int limit = 20)
+        public async Task<List<LocalRagAPI.Models.SearchResultItem>> Search(float[] embedding, string documentFilter = null, int limit = 20, string userId = null)
         {
             Filter filter = null;
 
@@ -94,6 +94,21 @@ namespace LocalRagAPI.Services
                 };
             }
 
+            // If userId provided, add user filter
+            if (!string.IsNullOrEmpty(userId))
+            {
+                if (filter == null) filter = new Filter();
+
+                filter.Must.Add(new Condition
+                {
+                    Field = new FieldCondition
+                    {
+                        Key = "user_id",
+                        Match = new Match { Keyword = userId }
+                    }
+                });
+            }
+
             var results = await _client.SearchAsync(
                 collectionName: COLLECTION,
                 vector: embedding,
@@ -112,7 +127,7 @@ namespace LocalRagAPI.Services
                 .ToList();
         }
 
-        public async Task<List<LocalRagAPI.Models.SearchResultItem>> KeywordSearch(string query, string documentFilter = null, int limit = 20)
+        public async Task<List<LocalRagAPI.Models.SearchResultItem>> KeywordSearch(string query, string documentFilter = null, int limit = 20, string userId = null)
         {
             var mustConditions = new List<Condition>();
 
@@ -141,6 +156,19 @@ namespace LocalRagAPI.Services
                         {
                             Keyword = documentFilter
                         }
+                    }
+                });
+            }
+
+            // optional user filter
+            if (!string.IsNullOrEmpty(userId))
+            {
+                mustConditions.Add(new Condition
+                {
+                    Field = new FieldCondition
+                    {
+                        Key = "user_id",
+                        Match = new Match { Keyword = userId }
                     }
                 });
             }
@@ -184,7 +212,7 @@ namespace LocalRagAPI.Services
             }
         }
 
-        public async Task<bool> HasPointsAsync(string documentFilter = null)
+        public async Task<bool> HasPointsAsync(string documentFilter = null, string userId = null)
         {
             Filter filter = null;
 
@@ -207,6 +235,20 @@ namespace LocalRagAPI.Services
                         }
                     }
                 };
+            }
+
+            if (!string.IsNullOrEmpty(userId))
+            {
+                if (filter == null) filter = new Filter();
+
+                filter.Must.Add(new Condition
+                {
+                    Field = new FieldCondition
+                    {
+                        Key = "user_id",
+                        Match = new Match { Keyword = userId }
+                    }
+                });
             }
 
             var scroll = await _client.ScrollAsync(
@@ -236,6 +278,37 @@ namespace LocalRagAPI.Services
                 }
             }
         }
+            };
+
+            await _client.DeleteAsync(
+                collectionName: COLLECTION,
+                filter: filter
+            );
+        }
+
+        public async Task DeleteByDocumentAndUserAsync(string documentName, string userId)
+        {
+            var filter = new Filter
+            {
+                Must =
+                {
+                    new Condition
+                    {
+                        Field = new FieldCondition
+                        {
+                            Key = "document",
+                            Match = new Match { Keyword = documentName }
+                        }
+                    },
+                    new Condition
+                    {
+                        Field = new FieldCondition
+                        {
+                            Key = "user_id",
+                            Match = new Match { Keyword = userId }
+                        }
+                    }
+                }
             };
 
             await _client.DeleteAsync(
