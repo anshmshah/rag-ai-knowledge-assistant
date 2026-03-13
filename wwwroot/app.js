@@ -5,6 +5,9 @@
         darkMode: false,
         mode: "rag",
         question: "",
+        sessions: [],
+        selectedSessionId: "",
+        selectedSessionTitle: "",
         messages: [],
         documents: [],
         selectedDoc: "",
@@ -34,8 +37,76 @@
                 this.darkMode = true
             }
 
+            // load existing sessions for the user
+            this.loadSessions();
 
 
+
+        },
+
+        async loadSessions() {
+            try {
+                const res = await fetch('/api/sessions');
+                if (!res.ok) return;
+                const data = await res.json();
+                this.sessions = data || [];
+
+                // auto-select first session if none selected
+                if (!this.selectedSessionId && this.sessions.length > 0) {
+                    this.selectSession(this.sessions[0]);
+                }
+            }
+            catch (e) {
+                console.error('Failed to load sessions', e);
+            }
+        },
+
+        async createSession() {
+            const title = prompt('Session title (optional)') || 'Chat';
+
+            try {
+                const res = await fetch('/api/sessions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ title })
+                });
+
+                if (!res.ok) {
+                    alert('Failed to create session');
+                    return;
+                }
+
+                const created = await res.json();
+                const session = { id: created.id, title: created.title, createdAt: created.createdAt, expiresAt: created.expiresAt };
+                this.sessions.unshift(session);
+                this.selectSession(session);
+            }
+            catch (e) {
+                console.error('Create session failed', e);
+                alert('Failed to create session');
+            }
+        },
+
+        async selectSession(s) {
+            if (!s) return;
+            this.selectedSessionId = s.id;
+            this.selectedSessionTitle = s.title || 'Chat';
+
+            try {
+                const res = await fetch(`/api/sessions/${s.id}`);
+                if (!res.ok) {
+                    console.error('Failed to load session messages');
+                    return;
+                }
+
+                const body = await res.json();
+                // body.messages is an array with {id, role, content, createdAt}
+                this.messages = body.messages.map(m => ({ role: m.role, content: m.content, timestamp: m.createdAt }));
+                this.scrollBottom();
+            }
+            catch (e) {
+                console.error('Error loading session', e);
+            }
         },
 
         toggleTheme() {
@@ -167,6 +238,17 @@
 
                     if (this.selectedDoc) {
                         url += `&doc=${encodeURIComponent(this.selectedDoc)}`
+                    }
+
+                    // include session id if selected
+                    if (this.selectedSessionId) {
+                        url += `&sessionId=${encodeURIComponent(this.selectedSessionId)}`
+                    }
+
+                    // include access token for SSE if present in localStorage
+                    const token = localStorage.getItem('token');
+                    if (token) {
+                        url += `${url.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(token)}`;
                     }
 
                     this.currentEventSource = new EventSource(url)
@@ -307,6 +389,8 @@
                         role: "assistant",
                         content: this.messages[lastIndex].content
                     })
+
+                    // if a session is selected, optionally persist via backend (server persists on ask endpoints)
 
                     // Refresh UI
                     this.messages = [...this.messages]
