@@ -137,7 +137,24 @@ namespace LocalRagAPI.Controllers
                 return;
             }
 
-            var history = _memory.BuildConversationHistory();
+            // determine or create session early so memory is scoped
+            ChatSession sessionEarly = null;
+            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sid2))
+            {
+                sessionEarly = await _chatSessionRepository.GetByIdAsync(sid2);
+            }
+
+            if (sessionEarly == null)
+            {
+                sessionEarly = await _chatSessionRepository.CreateAsync(new ChatSession
+                {
+                    UserId = currentUserId,
+                    Title = "Chat",
+                    ExpiresAt = DateTime.UtcNow.AddDays(30)
+                });
+            }
+
+            var history = _memory.BuildConversationHistory(currentUserId, sessionEarly.Id);
 
             // optional rewrite
             string rewrittenQuestion = question;
@@ -212,29 +229,17 @@ namespace LocalRagAPI.Controllers
             var combinedContext = contextBuilder.ToString();
             var prompt = _promptBuilder.BuildPrompt(combinedContext, history, question);
 
-            // --- Session & persistence: determine or create session
-            ChatSession session = null;
-            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sid))
-            {
-                session = await _chatSessionRepository.GetByIdAsync(sid);
-            }
+            // use the earlier session and persist user message
+            var session = sessionEarly;
 
-            if (session == null)
-            {
-                session = await _chatSessionRepository.CreateAsync(new ChatSession
-                {
-                    UserId = currentUserId,
-                    Title = "Chat",
-                    ExpiresAt = DateTime.UtcNow.AddDays(30)
-                });
-            }
-
-            // persist user message
             try
             {
                 await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "user", Content = question });
             }
             catch { }
+
+            // add to in-memory chat memory
+            _memory.AddUserMessage(currentUserId, session.Id, question);
 
             // stream LLM tokens directly
             var builder = new StringBuilder();
@@ -319,9 +324,12 @@ namespace LocalRagAPI.Controllers
                 });
             }
             catch { }
-
-            _memory.AddUserMessage(question);
-            _memory.AddAssistantMessage(finalAnswer);
+            // update in-memory conversation for this user/session
+            try
+            {
+                _memory.AddAssistantMessage(currentUserId, session.Id, finalAnswer);
+            }
+            catch { }
         }
 
 
@@ -438,10 +446,27 @@ namespace LocalRagAPI.Controllers
             }
 
             // =============================
-            // STEP 1 — CONVERSATION HISTORY
+            // STEP 1 — CONVERSATION HISTORY (scoped to user + session)
             // =============================
 
-            var history = _memory.BuildConversationHistory();
+            // determine or create session for this user
+            ChatSession sessionEarly = null;
+            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sidE))
+            {
+                sessionEarly = await _chatSessionRepository.GetByIdAsync(sidE);
+            }
+
+            if (sessionEarly == null)
+            {
+                sessionEarly = await _chatSessionRepository.CreateAsync(new ChatSession
+                {
+                    UserId = currentUserId,
+                    Title = "Chat",
+                    ExpiresAt = DateTime.UtcNow.AddDays(30)
+                });
+            }
+
+            var history = _memory.BuildConversationHistory(currentUserId, sessionEarly.Id);
 
             // =============================
             // STEP 2 — CONDITIONAL REWRITE
@@ -601,6 +626,7 @@ namespace LocalRagAPI.Controllers
             }
 
             try { await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "user", Content = question }); } catch { }
+            try { _memory.AddUserMessage(currentUserId, session.Id, question); } catch { }
 
 
             //var prompt = $@"
@@ -663,8 +689,7 @@ namespace LocalRagAPI.Controllers
             }
             catch { }
 
-            _memory.AddUserMessage(question);
-            _memory.AddAssistantMessage(response);
+            try { _memory.AddAssistantMessage(currentUserId, session.Id, response); } catch { }
 
             // =============================
             // STEP 10 — SOURCE DISPLAY
@@ -804,6 +829,13 @@ Assistant:
             }
 
             // Persist file on disk under /uploads/{userId}/{documentId}.{ext}
+            // Prevent creating duplicate active document with same filename for the same user
+            var existing = await _documentRepository.GetByFileNameAsync(file.FileName);
+            if (existing != null && existing.UserId == finalUserId)
+            {
+                return Conflict($"A non-deleted document with name '{file.FileName}' already exists.");
+            }
+
             var docEntity = new LocalRagAPI.Models.Document
             {
                 UserId = finalUserId,

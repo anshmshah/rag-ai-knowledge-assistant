@@ -27,9 +27,47 @@
 
     <div class="flex h-screen overflow-hidden">
 
+        <!-- AUTH VIEWS -->
+        <div x-show="!authenticated" class="m-auto w-full max-w-md p-6">
+            <div class="bg-white p-6 rounded shadow dark:bg-slate-800">
+                <template x-if="authView === 'login'">
+                    <div>
+                        <h2 class="text-lg font-semibold mb-4">Sign in</h2>
+                        <div class="mb-3">
+                            <input x-model="auth.email" placeholder="Email" class="w-full p-2 border rounded" />
+                        </div>
+                        <div class="mb-3">
+                            <input x-model="auth.password" type="password" placeholder="Password" class="w-full p-2 border rounded" />
+                        </div>
+                        <div class="flex gap-2">
+                            <button @click="login()" class="px-4 py-2 bg-indigo-500 text-white rounded">Sign in</button>
+                            <button @click="authView='register'" class="px-4 py-2 bg-gray-200 rounded">Register</button>
+                        </div>
+                    </div>
+                </template>
+
+                <template x-if="authView === 'register'">
+                    <div>
+                        <h2 class="text-lg font-semibold mb-4">Register</h2>
+                        <div class="mb-3">
+                            <input x-model="auth.email" placeholder="Email" class="w-full p-2 border rounded" />
+                        </div>
+                        <div class="mb-3">
+                            <input x-model="auth.password" type="password" placeholder="Password" class="w-full p-2 border rounded" />
+                        </div>
+                        <div class="flex gap-2">
+                            <button @click="register()" class="px-4 py-2 bg-indigo-500 text-white rounded">Create account</button>
+                            <button @click="authView='login'" class="px-4 py-2 bg-gray-200 rounded">Back</button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+
         <!-- SIDEBAR -->
 
-        <div class="w-64 bg-white/70 dark:bg-slate-800/80 backdrop-blur border-r border-slate-200 dark:border-slate-700 flex flex-col">
+        <div x-show="authenticated" class="w-64 bg-white/70 dark:bg-slate-800/80 backdrop-blur border-r border-slate-200 dark:border-slate-700 flex flex-col">
 
             <div class="p-5 text-lg font-semibold flex items-center gap-2">
                 🤖 AI Assistant
@@ -166,7 +204,7 @@
 
         <!-- MAIN -->
 
-        <div class="flex flex-col flex-1">
+        <div x-show="authenticated" class="flex flex-col flex-1">
 
             <!-- HEADER -->
 
@@ -189,6 +227,10 @@
                     <button @click="toggleTheme" class="theme-btn">
                         🌙
                     </button>
+
+                    <template x-if="authenticated">
+                        <button @click="logout()" class="px-3 py-1 bg-gray-200 rounded">Logout</button>
+                    </template>
 
                 </div>
 

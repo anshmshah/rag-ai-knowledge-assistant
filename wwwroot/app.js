@@ -5,6 +5,9 @@
         darkMode: false,
         mode: "rag",
         question: "",
+        authenticated: false,
+        authView: 'login',
+        auth: { email: '', password: '' },
         sessions: [],
         selectedSessionId: "",
         selectedSessionTitle: "",
@@ -20,7 +23,7 @@
         ingestionJobs: [],
         currentEventSource: null,
 
-        init() {
+        async init() {
 
             marked.setOptions({
                 gfm: true,
@@ -37,16 +40,132 @@
                 this.darkMode = true
             }
 
-            // load existing sessions for the user
-            this.loadSessions();
+            // determine auth status
+            const token = localStorage.getItem('token');
+            if (token) {
+                this.authenticated = true;
+                // clear any stale client state then load server state
+                this.clearClientState();
+                await this.loadSessions();
+                await this.loadDocuments();
+            } else {
+                this.authenticated = false;
+            }
 
 
 
         },
 
+        clearClientState() {
+            this.sessions = [];
+            this.messages = [];
+            this.documents = [];
+            this.selectedSessionId = '';
+            this.selectedSessionTitle = '';
+            this.selectedDoc = '';
+            this.ragHistory = [];
+            this.generalHistory = [];
+        },
+
+        async apiFetch(url, options = {}) {
+            try {
+                options = options || {};
+                options.headers = options.headers || {};
+
+                const token = localStorage.getItem('token');
+                if (token) {
+                    options.headers['Authorization'] = 'Bearer ' + token;
+                }
+
+                return await fetch(url, options);
+            }
+            catch (e) {
+                console.error('apiFetch error', e);
+                throw e;
+            }
+        },
+
+        async login() {
+            const email = this.auth.email?.trim();
+            const password = this.auth.password || '';
+            if (!email || !password) {
+                alert('Email and password are required');
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password })
+                });
+
+                if (!res.ok) {
+                    const txt = await res.text();
+                    alert('Login failed: ' + txt);
+                    return;
+                }
+
+                const body = await res.json();
+                if (body.token) {
+                    localStorage.setItem('token', body.token);
+                    // clear any previous client state
+                    this.clearClientState();
+                    this.authenticated = true;
+                    this.auth.password = '';
+                    await this.loadSessions();
+                    await this.loadDocuments();
+                }
+            }
+            catch (e) {
+                console.error('Login error', e);
+                alert('Login failed');
+            }
+        },
+
+        async register() {
+            const email = this.auth.email?.trim();
+            const password = this.auth.password || '';
+            if (!email || !password) {
+                alert('Email and password are required');
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password })
+                });
+
+                if (!res.ok) {
+                    const txt = await res.text();
+                    alert('Register failed: ' + txt);
+                    return;
+                }
+
+                // auto login after successful registration
+                await this.login();
+            }
+            catch (e) {
+                console.error('Register error', e);
+                alert('Registration failed');
+            }
+        },
+
+        logout() {
+            localStorage.removeItem('token');
+            this.authenticated = false;
+            // clear client state on logout to avoid leakage
+            this.clearClientState();
+            this.auth.email = '';
+            this.auth.password = '';
+            this.authView = 'login';
+        },
+
         async loadSessions() {
             try {
-                const res = await fetch('/api/sessions');
+                const res = await this.apiFetch('/api/sessions');
                 if (!res.ok) return;
                 const data = await res.json();
                 this.sessions = data || [];
@@ -61,11 +180,24 @@
             }
         },
 
+        async loadDocuments() {
+            try {
+                const res = await this.apiFetch('/api/documents');
+                if (!res.ok) return;
+                const list = await res.json();
+                // map to simple filename array for existing UI
+                this.documents = (list || []).map(d => d.fileName);
+            }
+            catch (e) {
+                console.error('Failed to load documents', e);
+            }
+        },
+
         async createSession() {
             const title = prompt('Session title (optional)') || 'Chat';
 
             try {
-                const res = await fetch('/api/sessions', {
+                const res = await this.apiFetch('/api/sessions', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ title })
@@ -79,6 +211,10 @@
                 const created = await res.json();
                 const session = { id: created.id, title: created.title, createdAt: created.createdAt, expiresAt: created.expiresAt };
                 this.sessions.unshift(session);
+                // clear previous client state before selecting new session
+                this.messages = [];
+                this.generalHistory = [];
+                this.ragHistory = [];
                 this.selectSession(session);
             }
             catch (e) {
@@ -93,7 +229,7 @@
             this.selectedSessionTitle = s.title || 'Chat';
 
             try {
-                const res = await fetch(`/api/sessions/${s.id}`);
+                const res = await this.apiFetch(`/api/sessions/${s.id}`);
                 if (!res.ok) {
                     console.error('Failed to load session messages');
                     return;
@@ -162,14 +298,15 @@
 
             try {
 
-                await fetch(`/api/AITest/document?name=${encodeURIComponent(doc)}`, {
+                const res = await this.apiFetch(`/api/AITest/document?name=${encodeURIComponent(doc)}`, {
                     method: "DELETE"
                 })
 
-                this.documents = this.documents.filter(d => d !== doc)
-
-                if (this.selectedDoc === doc) {
-                    this.selectedDoc = ""
+                if (res.ok) {
+                    await this.loadDocuments();
+                    if (this.selectedDoc === doc) this.selectedDoc = "";
+                } else {
+                    alert('Failed to delete document');
                 }
 
             }
@@ -362,7 +499,7 @@
 
                 else {
 
-                    const response = await fetch("/api/AITest/chat", {
+                    const response = await this.apiFetch("/api/AITest/chat", {
                         method: "POST",
                         headers: {
                             "Content-Type": "application/json"
@@ -506,7 +643,7 @@
 
             try {
 
-                const res = await fetch("/api/AITest/upload", {
+                const res = await this.apiFetch("/api/AITest/upload", {
                     method: "POST",
                     body: formData
                 })
@@ -521,9 +658,8 @@
                 //this.uploadMessage = text
 
 
-                if (!this.documents.includes(file.name)) {
-                    this.documents.push(file.name)
-                }
+                // refresh server-side document list
+                if (res.ok) await this.loadDocuments()
 
             }
             catch (err) {
@@ -556,13 +692,13 @@
 
             try {
 
-                await fetch("/api/AITest/upload", {
+                const res = await this.apiFetch("/api/AITest/upload", {
                     method: "POST",
                     body: formData
                 })
 
-                if (!this.documents.includes(file.name)) {
-                    this.documents.push(file.name)
+                if (res.ok) {
+                    await this.loadDocuments();
                 }
 
             }
