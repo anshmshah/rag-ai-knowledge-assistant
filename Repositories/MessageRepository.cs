@@ -26,5 +26,13 @@ namespace LocalRagAPI.Repositories
         {
             return await _db.Messages.AsNoTracking().Where(m => m.SessionId == sessionId).ToListAsync();
         }
+
+        public async Task DeleteBySessionAsync(Guid sessionId)
+        {
+            var messages = await _db.Messages.Where(m => m.SessionId == sessionId).ToListAsync();
+            if (!messages.Any()) return;
+            _db.Messages.RemoveRange(messages);
+            await _db.SaveChangesAsync();
+        }
     }
 }

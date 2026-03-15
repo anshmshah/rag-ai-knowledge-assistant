@@ -41,6 +41,7 @@ namespace LocalRagAPI.Data
                 b.HasKey(s => s.Id);
                 b.Property(s => s.UserId).IsRequired();
                 b.Property(s => s.Title).IsRequired(false);
+                b.Property(s => s.DeletedAt).IsRequired(false);
             });
 
             modelBuilder.Entity<Message>(b =>

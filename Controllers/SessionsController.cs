@@ -69,6 +69,36 @@ namespace LocalRagAPI.Controllers
             return Ok(new { id = created.Id, title = created.Title, createdAt = created.CreatedAt, expiresAt = created.ExpiresAt });
         }
 
+        // PUT /api/sessions/{id} - rename
+        [HttpPut("{id}")]
+        public async Task<IActionResult> Rename(Guid id, [FromBody] CreateSessionRequest req)
+        {
+            var userId = GetCurrentUserId();
+
+            var session = await _sessions.GetByIdAsync(id);
+            if (session == null) return NotFound();
+            if (session.UserId != userId) return Forbid();
+
+            await _sessions.UpdateTitleAsync(id, req?.Title ?? "Chat");
+            return Ok(new { id = id, title = req?.Title });
+        }
+
+        // DELETE /api/sessions/{id}
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> Delete(Guid id)
+        {
+            var userId = GetCurrentUserId();
+
+            var session = await _sessions.GetByIdAsync(id);
+            if (session == null) return NotFound();
+            if (session.UserId != userId) return Forbid();
+
+            // perform soft-delete of session (messages remain)
+            await _sessions.DeleteAsync(id);
+
+            return Ok(new { id = id });
+        }
+
         // GET /api/sessions/{id}
         [HttpGet("{id}")]
         public async Task<IActionResult> Get(Guid id)

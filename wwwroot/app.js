@@ -166,6 +166,7 @@
         async loadSessions() {
             try {
                 const res = await this.apiFetch('/api/sessions');
+                console.log(res);
                 if (!res.ok) return;
                 const data = await res.json();
                 this.sessions = data || [];
@@ -245,6 +246,55 @@
             }
         },
 
+        async renameSession(s) {
+            const title = prompt('New title for session', s.title || 'Chat');
+            if (title === null) return; // cancelled
+
+            try {
+                const res = await this.apiFetch(`/api/sessions/${s.id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ title })
+                });
+
+                if (!res.ok) {
+                    alert('Failed to rename session');
+                    return;
+                }
+
+                // update UI
+                s.title = title;
+                this.sessions = [...this.sessions];
+            }
+            catch (e) {
+                console.error('renameSession error', e);
+                alert('Failed to rename session');
+            }
+        },
+
+        async deleteSession(s) {
+            if (!confirm('Delete this session and its messages?')) return;
+
+            try {
+                const res = await this.apiFetch(`/api/sessions/${s.id}`, { method: 'DELETE' });
+                if (!res.ok) {
+                    alert('Failed to delete session');
+                    return;
+                }
+
+                // remove from UI
+                this.sessions = this.sessions.filter(x => x.id !== s.id);
+                if (this.selectedSessionId === s.id) {
+                    this.selectedSessionId = '';
+                    this.messages = [];
+                }
+            }
+            catch (e) {
+                console.error('deleteSession error', e);
+                alert('Failed to delete session');
+            }
+        },
+
         toggleTheme() {
 
             this.darkMode = !this.darkMode
@@ -258,6 +308,9 @@
 
 
         renderMessage(text) {
+            // defensive: treat null/undefined and literal 'undefined' as empty
+            if (text === null || text === undefined) return "";
+            if (String(text).trim() === "undefined") return "";
             if (!text) return ""
             // Work on a copy
             let t = String(text);
@@ -467,6 +520,9 @@
 
                         // If token starts with newline, keep as-is. Otherwise ensure token spacing
                         if (!token) return;
+
+                        // ensure messages[lastIndex].content is a string
+                        if (this.messages[lastIndex].content == null) this.messages[lastIndex].content = "";
 
                         if (buffer.length === 0 && this.messages[lastIndex].content && this.messages[lastIndex].content.length > 0) {
                             const lastChar = this.messages[lastIndex].content.slice(-1);

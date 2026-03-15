@@ -10,5 +10,7 @@ namespace LocalRagAPI.Repositories
         Task<ChatSession> CreateAsync(ChatSession session);
         Task<ChatSession> GetByIdAsync(Guid id);
         Task<IEnumerable<ChatSession>> ListByUserAsync(Guid userId);
+        Task UpdateTitleAsync(Guid id, string title);
+        Task DeleteAsync(Guid id);
     }
 }

@@ -9,5 +9,6 @@ namespace LocalRagAPI.Models
         public string Title { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime? ExpiresAt { get; set; }
+        public DateTime? DeletedAt { get; set; }
     }
 }

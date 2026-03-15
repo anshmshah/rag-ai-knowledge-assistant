@@ -9,5 +9,6 @@ namespace LocalRagAPI.Repositories
     {
         Task AddAsync(Message message);
         Task<IEnumerable<Message>> ListBySessionAsync(Guid sessionId);
+        Task DeleteBySessionAsync(Guid sessionId);
     }
 }
