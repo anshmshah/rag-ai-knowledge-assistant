@@ -11,19 +11,23 @@ namespace LocalRagAPI.Services
         private readonly Microsoft.Extensions.Logging.ILogger<QdrantService> _logger;
         private readonly bool _recreateOnStartup;
 
-        public QdrantService(Microsoft.Extensions.Logging.ILogger<QdrantService> logger, IConfiguration config)
+        public QdrantService(ILogger<QdrantService> logger, IConfiguration config)
         {
             _logger = logger;
-            AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
 
-            // Read optional configuration for Qdrant connection and startup behavior
-            var host = config["Qdrant:Host"] ?? "localhost";
-            var port = 6334;
-            if (int.TryParse(config["Qdrant:Port"], out var p)) port = p;
+            var url = config["Qdrant:Url"];
+            var apiKey = config["Qdrant:ApiKey"];
+
+            if (string.IsNullOrEmpty(url))
+                throw new Exception("Qdrant URL is not configured");
+
+            if (string.IsNullOrEmpty(apiKey))
+                throw new Exception("Qdrant API key is not configured");
 
             _recreateOnStartup = config.GetValue<bool>("Qdrant:RecreateOnStartup", false);
 
-            _client = new QdrantClient(host, port);
+            // ✅ Correct for Qdrant Cloud
+            _client = new QdrantClient(new Uri(url), apiKey);
         }
 
         // =========================
