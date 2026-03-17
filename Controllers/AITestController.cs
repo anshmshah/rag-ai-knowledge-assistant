@@ -130,12 +130,24 @@ namespace LocalRagAPI.Controllers
 
             var currentUserId = GetCurrentUserId();
 
-            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
+
+
+            // TEMP FIX: bypass Qdrant check
+            var hasPoints = true;
+
+            if (!hasPoints)
             {
                 await Response.WriteAsync("data: No documents uploaded. Please upload a document first.\n\n");
                 await Response.Body.FlushAsync();
                 return;
             }
+
+            //if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
+            //{
+            //    await Response.WriteAsync("data: No documents uploaded. Please upload a document first.\n\n");
+            //    await Response.Body.FlushAsync();
+            //    return;
+            //}
 
             // determine or create session early so memory is scoped
             ChatSession sessionEarly = null;
