@@ -1,38 +1,57 @@
 ﻿using LocalRagAPI.Models;
+using System.Collections.Concurrent;
 
 namespace LocalRagAPI.Services
 {
+    // ChatMemory stores messages per user+session key to isolate conversation history
     public class ChatMemory
     {
-        public List<ChatMessage> Messages { get; } = new();
+        // key: "{userId}|{sessionId}" where Guid.Empty is allowed for anonymous/local
+        private readonly ConcurrentDictionary<string, List<ChatMessage>> _memories = new();
 
-        public void AddUserMessage(string message)
+        private string Key(Guid userId, Guid sessionId) => $"{userId:N}|{sessionId:N}";
+
+        private List<ChatMessage> GetOrCreate(Guid userId, Guid sessionId)
         {
-            Messages.Add(new ChatMessage
+            var key = Key(userId, sessionId);
+            return _memories.GetOrAdd(key, _ => new List<ChatMessage>());
+        }
+
+        public void AddUserMessage(Guid userId, Guid sessionId, string message)
+        {
+            var list = GetOrCreate(userId, sessionId);
+            lock (list)
             {
-                Role = "user",
-                Content = message
-            });
+                list.Add(new ChatMessage { Role = "user", Content = message });
+                if (list.Count > 200) // simple cap
+                    list.RemoveRange(0, list.Count - 200);
+            }
         }
 
-        public void AddAssistantMessage(string message)
+        public void AddAssistantMessage(Guid userId, Guid sessionId, string message)
         {
-            Messages.Add(new ChatMessage
+            var list = GetOrCreate(userId, sessionId);
+            lock (list)
             {
-                Role = "assistant",
-                Content = message
-            });
+                list.Add(new ChatMessage { Role = "assistant", Content = message });
+                if (list.Count > 200)
+                    list.RemoveRange(0, list.Count - 200);
+            }
         }
 
-        public string BuildConversationHistory()
+        public string BuildConversationHistory(Guid userId, Guid sessionId)
         {
-            return string.Join("\n",
-                Messages.Select(m => $"{m.Role}: {m.Content}"));
+            var list = GetOrCreate(userId, sessionId);
+            lock (list)
+            {
+                return string.Join('\n', list.Select(m => $"{m.Role}: {m.Content}"));
+            }
         }
 
-        public void Clear()
+        public void Clear(Guid userId, Guid sessionId)
         {
-            Messages.Clear();
+            var key = Key(userId, sessionId);
+            _memories.TryRemove(key, out _);
         }
     }
 }

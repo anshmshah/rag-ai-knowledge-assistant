@@ -18,6 +18,8 @@ using static Google.Protobuf.WellKnownTypes.Field.Types;
 using static System.Net.Mime.MediaTypeNames;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 using static UglyToad.PdfPig.Core.PdfSubpath;
+using LocalRagAPI.Repositories;
+using Microsoft.AspNetCore.Hosting;
 
 namespace LocalRagAPI.Controllers
 {
@@ -30,19 +32,68 @@ namespace LocalRagAPI.Controllers
         private readonly ChatMemory _memory;
         private readonly JinaRerankerService _reranker;
         private readonly QdrantService _qdrant;
+        private readonly PromptBuilderService _promptBuilder;
+        private readonly Microsoft.Extensions.Logging.ILogger<AITestController> _logger;
+        private readonly IDocumentRepository _documentRepository;
+        private readonly IWebHostEnvironment _env;
+        private readonly IChatSessionRepository _chatSessionRepository;
+        private readonly IMessageRepository _messageRepository;
+        private readonly IQueryLogRepository _queryLogRepository;
 
         public AITestController(
             ILLMService llm,
             JinaEmbeddingService embeddingService,
             ChatMemory memory,
             JinaRerankerService reranker,
-            QdrantService qdrant)
+            QdrantService qdrant,
+            PromptBuilderService promptBuilder,
+            Microsoft.Extensions.Logging.ILogger<AITestController> logger,
+            IDocumentRepository documentRepository,
+            IWebHostEnvironment env,
+            IChatSessionRepository chatSessionRepository,
+            IMessageRepository messageRepository,
+            IQueryLogRepository queryLogRepository)
         {
             _llm = llm;
             _embeddingService = embeddingService;
             _memory = memory;
             _reranker = reranker;
             _qdrant = qdrant;
+            _promptBuilder = promptBuilder;
+            _logger = logger;
+            _documentRepository = documentRepository;
+            _env = env;
+            _chatSessionRepository = chatSessionRepository;
+            _messageRepository = messageRepository;
+            _queryLogRepository = queryLogRepository;
+        }
+
+        private Guid GetCurrentUserId()
+        {
+            if (User?.Identity?.IsAuthenticated == true)
+            {
+                var sub = User.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+                          ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+
+                if (Guid.TryParse(sub, out var parsed)) return parsed;
+            }
+
+            return Guid.Empty;
+        }
+
+        [HttpGet("ingest-status")]
+        public IActionResult IngestStatus(string jobId)
+        {
+            if (string.IsNullOrEmpty(jobId)) return BadRequest(new { error = "jobId is required" });
+
+            var jobStore = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.IngestionJobStore)) as LocalRagAPI.Services.IngestionJobStore;
+
+            if (jobStore == null) return StatusCode(500);
+
+            if (!jobStore.TryGet(jobId, out var status))
+                return NotFound(new { error = "job not found" });
+
+            return Ok(status);
         }
 
         [HttpGet]
@@ -64,7 +115,7 @@ namespace LocalRagAPI.Controllers
 
 
         [HttpGet("ask-rag-stream")]
-        public async Task AskRagStream(string question, string doc = null)
+        public async Task AskRagStream(string question, string doc = null, string sessionId = null)
         {
             Response.ContentType = "text/event-stream";
             Response.Headers.Add("Cache-Control", "no-cache");
@@ -73,47 +124,281 @@ namespace LocalRagAPI.Controllers
             if (string.IsNullOrWhiteSpace(question))
             {
                 await Response.WriteAsync("data: Question cannot be empty.\n\n");
+                await Response.Body.FlushAsync();
                 return;
             }
 
-            // Step 1 — Build RAG answer normally
-            var ragResponse = await AskRag(question, doc);
+            var currentUserId = GetCurrentUserId();
 
-            // Step 2 — Stream tokens instead of full text
-            var words = ragResponse.Answer.Split(" ");
-
-            foreach (var word in words)
+            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
             {
-                await Response.WriteAsync($"data: {word} \n\n");
+                await Response.WriteAsync("data: No documents uploaded. Please upload a document first.\n\n");
                 await Response.Body.FlushAsync();
-                await Task.Delay(10);
+                return;
             }
 
+            // determine or create session early so memory is scoped
+            ChatSession sessionEarly = null;
+            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sid2))
+            {
+                sessionEarly = await _chatSessionRepository.GetByIdAsync(sid2);
+            }
+
+            if (sessionEarly == null)
+            {
+                sessionEarly = await _chatSessionRepository.CreateAsync(new ChatSession
+                {
+                    UserId = currentUserId,
+                    Title = "Chat",
+                    ExpiresAt = DateTime.UtcNow.AddDays(30)
+                });
+            }
+
+            var history = _memory.BuildConversationHistory(currentUserId, sessionEarly.Id);
+
+            // optional rewrite
+            string rewrittenQuestion = question;
+            bool needsRewrite = NeedsRewrite(question);
+
+            if (needsRewrite)
+            {
+                var contextualQuestion = $@"
+                    Conversation History:
+                    {history}
+
+                    User Question:
+                    {question}
+
+                    Rewrite the question so it is clear for document search.
+                    Return only the rewritten question.
+                ";
+
+                rewrittenQuestion = await _llm.GenerateResponse(contextualQuestion);
+            }
+
+            var queries = new List<string> { rewrittenQuestion };
+            var embeddings = await _embeddingService.GenerateEmbeddings(queries);
+            var userIdStr = currentUserId == Guid.Empty ? null : currentUserId.ToString();
+
+            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc, 50, userIdStr));
+            var vectorResults = await Task.WhenAll(vectorTasks);
+            var vectorItems = vectorResults.SelectMany(r => r).ToList();
+
+            var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50, userIdStr);
+
+            var candidateItems = vectorItems
+                .Concat(keywordItems)
+                .Where(i => !string.IsNullOrWhiteSpace(i.Content) && i.Content.Length > 30)
+                .GroupBy(i => i.Content)
+                .Select(g => g.First())
+                .Take(60)
+                .ToList();
+
+            if (!candidateItems.Any())
+            {
+                await Response.WriteAsync("data: This question is outside the scope of the uploaded documents.\n\n");
+                await Response.Body.FlushAsync();
+                await Response.WriteAsync("data: [DONE]\n\n");
+                await Response.Body.FlushAsync();
+                return;
+            }
+
+            var candidateContents = candidateItems.Select(i => i.Content).ToList();
+            var rerankedChunks = await _reranker.Rerank(rewrittenQuestion, candidateContents);
+
+            if (!rerankedChunks.Any())
+            {
+                await Response.WriteAsync("data: I cannot find that information in the uploaded documents.\n\n");
+                await Response.Body.FlushAsync();
+                await Response.WriteAsync("data: [DONE]\n\n");
+                await Response.Body.FlushAsync();
+                return;
+            }
+
+            // build context
+            var contextBuilder = new StringBuilder();
+            int sourceIndex = 1;
+            foreach (var chunk in rerankedChunks.Take(4))
+            {
+                contextBuilder.AppendLine($"[Source {sourceIndex}]");
+                contextBuilder.AppendLine(chunk);
+                contextBuilder.AppendLine();
+                sourceIndex++;
+            }
+
+            var combinedContext = contextBuilder.ToString();
+            var prompt = _promptBuilder.BuildPrompt(combinedContext, history, question);
+
+            // use the earlier session and persist user message
+            var session = sessionEarly;
+
+            try
+            {
+                await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "user", Content = question });
+            }
+            catch { }
+
+            // add to in-memory chat memory
+            _memory.AddUserMessage(currentUserId, session.Id, question);
+
+            // stream LLM tokens directly
+            var builder = new StringBuilder();
+
+            await foreach (var token in _llm.StreamResponse(prompt))
+            {
+                if (string.IsNullOrEmpty(token))
+                    continue;
+
+                // append to accumulated answer
+                builder.Append(token);
+
+                // forward token as SSE (raw, client buffers)
+                await Response.WriteAsync($"data: {token}\n\n");
+                await Response.Body.FlushAsync();
+            }
+
+            // send done
+            // Before finishing, send a cleaned final payload so client can replace streamed partials
+            string CleanFormatting(string text)
+            {
+                if (string.IsNullOrEmpty(text)) return string.Empty;
+
+                // Normalize CRLF
+                var t = text.Replace("\r\n", "\n");
+
+                // Ensure headings are explicit
+                t = System.Text.RegularExpressions.Regex.Replace(t, "(^|\n)(Summary)(?!\\n)", "$1### Summary\n\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                t = System.Text.RegularExpressions.Regex.Replace(t, "(^|\n)(Key Points)(?!\\n)", "$1### Key Points\n\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                t = System.Text.RegularExpressions.Regex.Replace(t, "(^|\n)(Detailed Explanation)(?!\\n)", "$1### Detailed Explanation\n\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                t = System.Text.RegularExpressions.Regex.Replace(t, "(^|\n)(Sources)(?!\\n)", "$1### Sources\n\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                // Ensure a blank line before list items
+                t = System.Text.RegularExpressions.Regex.Replace(t, "\n- ", "\n\n- ");
+
+                // Collapse multiple blank lines
+                t = System.Text.RegularExpressions.Regex.Replace(t, "\n{3,}", "\n\n");
+
+                return t.Trim();
+            }
+
+            var finalClean = CleanFormatting(builder.ToString());
+
+            // send final cleaned as a single SSE event prefixed with [FINAL]
+            // write prefix line
+            await Response.WriteAsync("data: [FINAL]\n");
+
+            // write each line as data: to preserve newlines in event.data
+            foreach (var line in finalClean.Split('\n'))
+            {
+                await Response.WriteAsync($"data: {line}\n");
+            }
+
+            await Response.WriteAsync("\n");
+            await Response.Body.FlushAsync();
+
+            // send done
             await Response.WriteAsync("data: [DONE]\n\n");
             await Response.Body.FlushAsync();
+
+            // save memory with final assembled response
+            var finalAnswer = builder.ToString();
+            // persist assistant message and query log
+            try
+            {
+                // attempt to map source document to a stored Document
+                LocalRagAPI.Models.Document mappedDoc = null;
+                var topSource = candidateItems.FirstOrDefault(ci => rerankedChunks.Take(4).Contains(ci.Content) && !string.IsNullOrEmpty(ci.Document));
+                if (topSource != null)
+                {
+                    mappedDoc = await _documentRepository.GetByFileNameAsync(topSource.Document);
+                }
+
+                await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "assistant", Content = finalAnswer });
+
+                await _queryLogRepository.CreateAsync(new QueryLog
+                {
+                    UserId = currentUserId,
+                    DocumentId = mappedDoc?.Id,
+                    Question = question,
+                    Answer = finalAnswer
+                });
+            }
+            catch { }
+            // update in-memory conversation for this user/session
+            try
+            {
+                _memory.AddAssistantMessage(currentUserId, session.Id, finalAnswer);
+            }
+            catch { }
         }
-        // working code
-        //[HttpGet("ask-rag-stream")]
-        //public async Task AskRagStream(string question, string doc = null)
-        //{
-        //    Response.ContentType = "text/event-stream";
-        //    Response.Headers.Add("Cache-Control", "no-cache");
-        //    Response.Headers.Add("Connection", "keep-alive");
-
-        //    var ragResponse = await AskRag(question, doc);
-
-        //    foreach (var word in ragResponse.Answer.Split("\n"))
-        //    {
-        //        await Response.WriteAsync($"data: {word} \n\n");
-        //        await Response.Body.FlushAsync();
-        //        await Task.Delay(25);
-        //    }
-
-        //    await Response.WriteAsync("data: [DONE]\n\n");
-        //    await Response.Body.FlushAsync();
-        //}
 
 
+
+        [HttpDelete("document")]
+        public async Task<IActionResult> DeleteDocument(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return BadRequest("Document name is required.");
+
+            try
+            {
+                // support deleting by id or by filename
+                LocalRagAPI.Models.Document doc = null;
+
+                if (Guid.TryParse(name, out var id))
+                {
+                    doc = await _documentRepository.GetByIdAsync(id);
+                }
+                else
+                {
+                    doc = await _documentRepository.GetByFileNameAsync(name);
+                }
+
+                if (doc == null)
+                    return NotFound(new { error = "Document not found" });
+
+                // if auth enabled, ensure ownership
+                if (User?.Identity?.IsAuthenticated == true)
+                {
+                    var sub = User.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+                              ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+
+                    if (!Guid.TryParse(sub, out var uid) || uid != doc.UserId)
+                    {
+                        return Forbid();
+                    }
+                }
+
+                // remove payloads from Qdrant scoped to this user
+                try
+                {
+                    await _qdrant.DeleteByDocumentAndUserAsync(doc.FileName, doc.UserId.ToString());
+                }
+                catch
+                {
+                    // fallback to broad delete
+                    await _qdrant.DeleteByDocumentAsync(doc.FileName);
+                }
+
+                // soft-delete record and remove file
+                await _documentRepository.MarkDeletedAsync(doc.Id);
+
+                try
+                {
+                    if (!string.IsNullOrEmpty(doc.FilePath) && System.IO.File.Exists(doc.FilePath))
+                        System.IO.File.Delete(doc.FilePath);
+                }
+                catch { }
+
+                return Ok(new { message = $"Document '{name}' deleted successfully." });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error deleting document {Document}", name);
+
+                return StatusCode(500, "Failed to delete document.");
+            }
+        }
 
 
         // =========================
@@ -121,8 +406,20 @@ namespace LocalRagAPI.Controllers
         // =========================
 
         [HttpGet("ask-rag")]
-        public async Task<RagResponse> AskRag(string question,string doc = null)
+        public async Task<RagResponse> AskRag(string question, string doc = null, string sessionId = null)
         {
+
+            var currentUserId = GetCurrentUserId();
+
+            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
+            {
+                return new RagResponse
+                {
+                    Answer = "No documents uploaded. Please upload a document first.",
+                    Sources = new List<string>()
+                };
+            }
+
             if (string.IsNullOrWhiteSpace(question))
             {
                 return new RagResponse
@@ -149,10 +446,27 @@ namespace LocalRagAPI.Controllers
             }
 
             // =============================
-            // STEP 1 — CONVERSATION HISTORY
+            // STEP 1 — CONVERSATION HISTORY (scoped to user + session)
             // =============================
 
-            var history = _memory.BuildConversationHistory();
+            // determine or create session for this user
+            ChatSession sessionEarly = null;
+            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sidE))
+            {
+                sessionEarly = await _chatSessionRepository.GetByIdAsync(sidE);
+            }
+
+            if (sessionEarly == null)
+            {
+                sessionEarly = await _chatSessionRepository.CreateAsync(new ChatSession
+                {
+                    UserId = currentUserId,
+                    Title = "Chat",
+                    ExpiresAt = DateTime.UtcNow.AddDays(30)
+                });
+            }
+
+            var history = _memory.BuildConversationHistory(currentUserId, sessionEarly.Id);
 
             // =============================
             // STEP 2 — CONDITIONAL REWRITE
@@ -191,23 +505,7 @@ namespace LocalRagAPI.Controllers
             // STEP 3 — MULTI QUERY GENERATION
             // =============================
 
-            //var multiQueryPrompt = $@"
-            //    Generate 3 search queries for retrieving relevant documents.
-
-            //    Question:
-            //    {rewrittenQuestion}
-
-            //    Return one query per line.
-            //";
-
-            //var multiQueriesText = await _llm.GenerateResponse(multiQueryPrompt);
-
-            //var queries = multiQueriesText
-            //    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            //    .Select(q => q.Trim())
-            //    .ToList();
-
-            //queries.Add(rewrittenQuestion);
+   
 
             var queries = new List<string> { rewrittenQuestion };
 
@@ -222,13 +520,14 @@ namespace LocalRagAPI.Controllers
             // =============================
 
 
-            // VECTOR SEARCH
-            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc));
+            var userIdStr = currentUserId == Guid.Empty ? null : currentUserId.ToString();
+
+            // VECTOR SEARCH — retrieve larger candidate pool
+            var vectorTasks = embeddings.Select(e => _qdrant.Search(e, doc, 50, userIdStr));
             var vectorResults = await Task.WhenAll(vectorTasks);
 
-            var vectorChunks = vectorResults
+            var vectorItems = vectorResults
                 .SelectMany(r => r)
-                .Distinct()
                 .ToList();
 
             // KEYWORD MATCHING (LOCAL)
@@ -237,44 +536,20 @@ namespace LocalRagAPI.Controllers
                 .Split(" ", StringSplitOptions.RemoveEmptyEntries);
 
 
-            var keywordChunks = await _qdrant.KeywordSearch(rewrittenQuestion, doc);
-            //working and also fast chage on 11.03.26 12;15
+            var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50, userIdStr);
+            
 
-            //var keywordChunks = vectorChunks
-            //    .Where(chunk =>
-            //        keywords.Any(k =>
-            //            chunk.ToLower().Contains(rewrittenQuestion.ToLower())))
-            //    .ToList();
+            // Merge vector + keyword results, filter tiny chunks and deduplicate by content
+            var candidateItems = vectorItems
+                .Concat(keywordItems)
+                .Where(i => !string.IsNullOrWhiteSpace(i.Content) && i.Content.Length > 30)
+                .GroupBy(i => i.Content)
+                .Select(g => g.First())
+                .Take(60)
+                .ToList();
+            
 
-            // MERGE VECTOR + KEYWORD RESULTS
-
-            var candidateChunks = vectorChunks
-    .Concat(keywordChunks)
-    .Where(c => c.Length > 50)
-    .Distinct()
-    .Take(12)
-    .ToList();
-            //old code working 11.03.26 12:22
-
-            //var candidateChunks = vectorChunks
-            //    .Concat(keywordChunks)
-            //    .Distinct()
-            //    .Take(12)
-            //    .ToList();
-
-            //working fast before implementation of hybrid search
-
-            //var searchTasks = embeddings
-            //    .Select(e => _qdrant.Search(e,doc));
-
-            //var searchResults = await Task.WhenAll(searchTasks);
-
-            //var candidateChunks = searchResults
-            //    .SelectMany(r => r)
-            //    .Distinct()
-            //    .ToList();
-
-            if (!candidateChunks.Any())
+            if (!candidateItems.Any())
             {
                 return new RagResponse
                 {
@@ -287,7 +562,9 @@ namespace LocalRagAPI.Controllers
             // STEP 6 — RERANK
             // =============================
 
-            var rerankedChunks = await _reranker.Rerank(rewrittenQuestion, candidateChunks);
+            var candidateContents = candidateItems.Select(i => i.Content).ToList();
+
+            var rerankedChunks = await _reranker.Rerank(rewrittenQuestion, candidateContents);
 
             if (!rerankedChunks.Any())
             {
@@ -301,6 +578,11 @@ namespace LocalRagAPI.Controllers
             // =============================
             // STEP 7 — CONTEXT BUILDING
             // =============================
+
+            // map content back to original search items for source metadata
+            var itemByContent = candidateItems
+                .GroupBy(i => i.Content)
+                .ToDictionary(g => g.Key, g => g.First());
 
             var contextBuilder = new StringBuilder();
 
@@ -321,95 +603,31 @@ namespace LocalRagAPI.Controllers
             // STEP 8 — FINAL PROMPT
             // =============================
 
-            var prompt = $@"You are an AI assistant that answers questions using the provided documents.
 
-Instructions:
-- Use ONLY the provided context to answer the question.
-- If the answer is not found in the context, respond exactly with:
-'I cannot find that information in the uploaded documents.'
-- Do not invent information.
+            var prompt = _promptBuilder.BuildPrompt(combinedContext, history, question);
 
-IMPORTANT:
-Always leave a blank line after headings.
-Never place headings and text on the same line.
+            
 
-When an answer exists, format the response using Markdown.
+            // session handling and persistence
+            ChatSession session = null;
+            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sid))
+            {
+                session = await _chatSessionRepository.GetByIdAsync(sid);
+            }
 
-Structure:
+            if (session == null)
+            {
+                session = await _chatSessionRepository.CreateAsync(new ChatSession
+                {
+                    UserId = currentUserId,
+                    Title = "Chat",
+                    ExpiresAt = DateTime.UtcNow.AddDays(30)
+                });
+            }
 
-### Summary
-Short explanation of the answer.
+            try { await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "user", Content = question }); } catch { }
+            try { _memory.AddUserMessage(currentUserId, session.Id, question); } catch { }
 
-### Key Points
-- Important point
-- Important point
-- Important point
-
-### Detailed Explanation
-Provide a detailed explanation based only on the context.
-
-### Sources
-List the sources used such as:
-- [Source 1]
-- [Source 2]
-
-Formatting rules:
-- Always leave a blank line after headings
-- Use bullet points with '-'
-- Never place headings inline with text
-
-Context:
-{combinedContext}
-
-Conversation History:
-{history}
-
-Question:
-{question}";
-
-//            var prompt = $@"
-//You are an AI assistant for answering questions from company documents.
-
-//Answer ONLY using the provided context.
-
-//Use short paragraphs and bullet points when appropriate.
-//Avoid long walls of text.
-
-//Format your answer EXACTLY like this:
-
-//### Summary
-//Provide a short 2-3 sentence summary.
-
-//### Key Points
-//- Bullet point
-//- Bullet point
-//- Bullet point
-
-//### Detailed Explanation
-//Explain clearly using paragraphs.
-
-//### Sources
-//Cite sources like [Source 1].
-
-//Rules:
-//- Use bullet points when possible
-//- Do NOT generate information not present in context
-//- If the answer is not in the context say:
-
-//'I cannot find that information in the uploaded documents.'
-
-//Context:
-//{combinedContext}
-
-//Conversation History:
-//{history}
-
-//Question:
-//{question}
-//";
-
-
-            //working code 09/03/2026
 
             //var prompt = $@"
             //    You are an AI assistant for answering questions from company documents.
@@ -445,11 +663,33 @@ Question:
             
 
             // =============================
-            // STEP 9 — SAVE MEMORY
+            // STEP 9 — SAVE MEMORY AND PERSIST
             // =============================
 
-            _memory.AddUserMessage(question);
-            _memory.AddAssistantMessage(response);
+            // persist assistant message and query log
+            try
+            {
+                LocalRagAPI.Models.Document mappedDoc = null;
+                // try to find a matching source document
+                var topSource = candidateItems.FirstOrDefault(ci => rerankedChunks.Take(4).Contains(ci.Content) && !string.IsNullOrEmpty(ci.Document));
+                if (topSource != null)
+                {
+                    mappedDoc = await _documentRepository.GetByFileNameAsync(topSource.Document);
+                }
+
+                await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "assistant", Content = response });
+
+                await _queryLogRepository.CreateAsync(new QueryLog
+                {
+                    UserId = currentUserId,
+                    DocumentId = mappedDoc?.Id,
+                    Question = question,
+                    Answer = response
+                });
+            }
+            catch { }
+
+            try { _memory.AddAssistantMessage(currentUserId, session.Id, response); } catch { }
 
             // =============================
             // STEP 10 — SOURCE DISPLAY
@@ -457,11 +697,20 @@ Question:
 
             var sources = new List<string>();
 
-            if (!response.Contains("I cannot find", StringComparison.OrdinalIgnoreCase))
+            // Use the reranked chunks and original search metadata for better source display
+            if (rerankedChunks != null && rerankedChunks.Any())
             {
-                sources = Enumerable
-                    .Repeat("📄 Uploaded Document", 3)
-                    .ToList();
+                foreach (var c in rerankedChunks.Take(3))
+                {
+                    if (itemByContent != null && itemByContent.TryGetValue(c, out var item) && !string.IsNullOrEmpty(item.Document))
+                    {
+                        sources.Add($"📄 {item.Document}");
+                    }
+                    else
+                    {
+                        sources.Add("📄 Uploaded Document");
+                    }
+                }
             }
 
             return new RagResponse
@@ -470,149 +719,7 @@ Question:
                 Sources = sources
             };
         }
-        //old working code slow 
-
-        //        [HttpGet("ask-rag")]
-        //        public async Task<RagResponse> AskRag(string question)
-        //        {
-        //            if (string.IsNullOrWhiteSpace(question))
-        //            {
-        //                return new RagResponse
-        //                {
-        //                    Answer = "Question cannot be empty.",
-        //                    Sources = new List<string>()
-        //                };
-        //            }
-
-        //            // =============================
-        //            // STEP 1 — FOLLOW-UP CONTEXT
-        //            // =============================
-
-        //            var history = _memory.BuildConversationHistory();
-
-        //            var contextualQuestion = $@"
-        //Conversation History:
-        //{history}
-
-        //User Question:
-        //{question}
-
-        //Rewrite the question so it is clear for document search.
-        //Return only the rewritten question.
-        //";
-
-        //            var rewrittenQuestion = await _llm.GenerateResponse(contextualQuestion);
-
-        //            var lower = question.ToLower();
-
-        //            if (lower == "hello" || lower == "hi" || lower == "hey")
-        //            {
-        //                var quick = await _llm.GenerateResponse(question);
-
-        //                return new RagResponse
-        //                {
-        //                    Answer = quick,
-        //                    Sources = new List<string>()
-        //                };
-        //            }
-
-        //            // =============================
-        //            // STEP 2 — EMBEDDING SEARCH
-        //            // =============================
-
-        //            var questionEmbedding = (await _embeddingService
-        //                .GenerateEmbeddings(new List<string> { rewrittenQuestion }))[0];
-
-        //            // =============================
-        //            // STEP 3 — VECTOR SEARCH (QDRANT)
-        //            // =============================
-
-        //            var candidateChunks = await _qdrant.Search(questionEmbedding);
-
-        //            if (!candidateChunks.Any())
-        //            {
-        //                return new RagResponse
-        //                {
-        //                    Answer = "This question is outside the scope of the uploaded documents.",
-        //                    Sources = new List<string>()
-        //                };
-        //            }
-
-        //            // =============================
-        //            // STEP 4 — RERANK
-        //            // =============================
-
-        //            var rerankedChunks = await _reranker.Rerank(rewrittenQuestion, candidateChunks);
-
-        //            // =============================
-        //            // STEP 5 — SOURCE CITATION
-        //            // =============================
-
-        //            var contextBuilder = new StringBuilder();
-        //            int sourceIndex = 1;
-
-        //            foreach (var chunk in rerankedChunks)
-        //            {
-        //                contextBuilder.AppendLine($"[Source {sourceIndex}]");
-        //                contextBuilder.AppendLine(chunk);
-        //                contextBuilder.AppendLine();
-
-        //                sourceIndex++;
-        //            }
-
-        //            var combinedContext = contextBuilder.ToString();
-
-        //            // =============================
-        //            // STEP 6 — FINAL PROMPT
-        //            // =============================
-
-        //            var prompt = $@"
-        //You are an AI assistant for answering questions from company documents.
-
-        //Rules:
-        //- Answer ONLY using the provided context.
-        //- If the answer is not present say:
-        //'I cannot find that information in the uploaded documents.'
-        //- Always cite the source number like [Source 1].
-
-        //Context:
-        //{combinedContext}
-
-        //Conversation History:
-        //{history}
-
-        //Question:
-        //{question}
-
-        //Provide a clear answer and include source citations.
-        //";
-
-        //            var response = await _llm.GenerateResponse(prompt);
-
-        //            // =============================
-        //            // STEP 7 — SAVE MEMORY
-        //            // =============================
-
-        //            _memory.AddUserMessage(question);
-        //            _memory.AddAssistantMessage(response);
-
-        //            var sources = new List<string>();
-
-        //            // Only show sources if the AI actually found an answer
-        //            if (!response.Contains("I cannot find", StringComparison.OrdinalIgnoreCase))
-        //            {
-        //                sources = rerankedChunks
-        //                    .Take(3)
-        //                    .Select(_ => $"📄 {Request.Query["document"]}")
-        //                    .ToList();
-        //            }
-
-        //            return new RagResponse
-        //            {
-        //                Answer = response,
-        //                Sources = sources
-        //            };
-        //        }
+        
 
         // =========================
         // GENERAL CHAT
@@ -648,54 +755,11 @@ Assistant:
         }
 
 
-        //working but dont have chat memory
-
-
-        //[HttpGet("chat")]
-        //public async Task<RagResponse> Chat(string question)
-        //{
-        //    if (string.IsNullOrWhiteSpace(question))
-        //    {
-        //        return new RagResponse
-        //        {
-        //            Answer = "Please ask a question.",
-        //            Sources = new List<string>()
-        //        };
-        //    }
-
-        //    var answer = await _llm.GenerateResponse(question);
-
-        //    return new RagResponse
-        //    {
-        //        Answer = answer,
-        //        Sources = new List<string>()
-        //    };
-        //}
-
-        //.....old working code but slow response.......
-
-        //[HttpGet("chat")]
-        //public async Task<RagResponse> Chat(string question, string mode = "rag")
-        //{
-        //    if (mode == "chat")
-        //    {
-        //        var answer = await _llm.GenerateResponse(question);
-
-        //        return new RagResponse
-        //        {
-        //            Answer = answer,
-        //            Sources = new List<string>()
-        //        };
-        //    }
-
-        //    return await AskRag(question);
-        //}
-
         // =========================
         // FILE UPLOAD
         // =========================
         [HttpPost("upload")]
-        public async Task<string> UploadFile(IFormFile file)
+        public async Task<ActionResult<string>> UploadFile(IFormFile file)
         {
             if (file == null || file.Length == 0)
                 return "Invalid file.";
@@ -737,77 +801,194 @@ Assistant:
                 return $"Error reading file: {ex.Message}";
             }
 
-            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            // Create ingestion job metadata
+            var jobId = Guid.NewGuid().ToString();
 
-            await ProcessDocument(text, file.FileName);
+            var job = new LocalRagAPI.Models.IngestionJobStatus
+            {
+                JobId = jobId,
+                State = LocalRagAPI.Models.IngestionJobState.Queued,
+                CreatedAt = DateTime.UtcNow,
+                CompletedBatches = 0,
+                TotalBatches = 0
+            };
 
-            stopwatch.Stop();
+            var jobStore = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.IngestionJobStore)) as LocalRagAPI.Services.IngestionJobStore;
+            var queue = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.DocumentIngestionQueue)) as LocalRagAPI.Services.DocumentIngestionQueue;
 
-            return $"File processed successfully in {stopwatch.ElapsedMilliseconds} ms";
+            jobStore?.AddJob(job);
+
+            // Determine user ownership. If authenticated use claim, otherwise use Guid.Empty as "local" user
+            Guid finalUserId = Guid.Empty;
+            if (User?.Identity?.IsAuthenticated == true)
+            {
+                var sub = User.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+                          ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+
+                if (Guid.TryParse(sub, out var parsed)) finalUserId = parsed;
+            }
+
+            // Persist file on disk under /uploads/{userId}/{documentId}.{ext}
+            // Prevent creating duplicate active document with same filename for the same user
+            var existing = await _documentRepository.GetByFileNameAsync(file.FileName);
+            if (existing != null && existing.UserId == finalUserId)
+            {
+                return Conflict($"A non-deleted document with name '{file.FileName}' already exists.");
+            }
+
+            var docEntity = new LocalRagAPI.Models.Document
+            {
+                UserId = finalUserId,
+                FileName = file.FileName
+            };
+
+            var uploadsRoot = Path.Combine(_env.ContentRootPath, "uploads");
+            var userFolder = Path.Combine(uploadsRoot, finalUserId.ToString());
+            Directory.CreateDirectory(userFolder);
+
+            var ext = Path.GetExtension(file.FileName) ?? string.Empty;
+            var diskFileName = docEntity.Id.ToString() + ext;
+            var diskPath = Path.Combine(userFolder, diskFileName);
+
+            try
+            {
+                await using (var fs = new FileStream(diskPath, FileMode.Create))
+                {
+                    await file.CopyToAsync(fs);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to save uploaded file");
+                return StatusCode(500, "Failed to save uploaded file");
+            }
+
+            docEntity.FilePath = diskPath;
+            await _documentRepository.CreateAsync(docEntity);
+
+            var request = new LocalRagAPI.Models.DocumentIngestionRequest
+            {
+                JobId = jobId,
+                DocumentName = file.FileName,
+                Text = text,
+                FileName = file.FileName,
+                DocumentId = docEntity.Id,
+                UserId = docEntity.UserId
+            };
+
+            // try enqueue with short timeout
+            var enqueued = await queue.EnqueueAsync(request, TimeSpan.FromSeconds(5));
+
+            if (!enqueued)
+            {
+                jobStore?.MarkFailed(jobId, "Queue is full");
+                return StatusCode(429, "Server busy, try again later.");
+            }
+
+            // return 202 with job id and document id
+            return Accepted(new { jobId, documentId = docEntity.Id });
         }
 
-        // =========================
-        // DOCUMENT PROCESSING
-        // =========================
         private async Task ProcessDocument(string text, string documentName)
         {
+            var swTotal = System.Diagnostics.Stopwatch.StartNew();
 
-            var words = text.Split(" ", StringSplitOptions.RemoveEmptyEntries);
+            var sentences = text
+                .Split(new[] { ".", "!", "?" }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim())
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .ToList();
 
-            int chunkSize = 250;
-            int overlap = 50;
+            int chunkSentenceSize = 6;
+            int overlap = 2;
+            int maxChunks = 300;
 
             var chunks = new List<string>();
 
-            for (int i = 0; i < words.Length; i += chunkSize - overlap)
+            for (int i = 0; i < sentences.Count; i += (chunkSentenceSize - overlap))
             {
-                var chunkWords = words.Skip(i).Take(chunkSize);
-                var chunkText = string.Join(" ", chunkWords);
+                var chunkSentences = sentences
+                    .Skip(i)
+                    .Take(chunkSentenceSize)
+                    .ToList();
 
+                if (!chunkSentences.Any())
+                    break;
+
+                var chunkText = string.Join(". ", chunkSentences) + ".";
                 chunks.Add(chunkText);
+
+                if (chunks.Count >= maxChunks)
+                    break;
             }
 
-            //by sentence
+            // Batch embedding requests to avoid huge payloads and improve throughput
+            // Increased batch size to reduce total number of embedding requests.
+            int batchSize = 256;
 
-            //var sentences = text
-            //    .Split(new[] { ".", "!", "?" }, StringSplitOptions.RemoveEmptyEntries)
-            //    .Select(s => s.Trim())
-            //    .Where(s => !string.IsNullOrWhiteSpace(s))
-            //    .ToList();
-
-            //int chunkSentenceSize = 8;
-            //int overlap = 2;
-            //int maxChunks = 200;
-
-            //var chunks = new List<string>();
-
-            //for (int i = 0; i < sentences.Count; i += (chunkSentenceSize - overlap))
-            //{
-            //    if (chunks.Count >= maxChunks)
-            //        break;
-
-            //    var chunkSentences = sentences
-            //        .Skip(i)
-            //        .Take(chunkSentenceSize)
-            //        .ToList();
-
-            //    if (!chunkSentences.Any())
-            //        break;
-
-            //    var chunkText = string.Join(". ", chunkSentences) + ".";
-            //    chunks.Add(chunkText);
-            //}
-
-            var embeddings = await _embeddingService.GenerateEmbeddings(chunks);
-
-            for (int i = 0; i < chunks.Count; i++)
+            // Build list of batches
+            var batches = new List<List<string>>();
+            for (int i = 0; i < chunks.Count; i += batchSize)
             {
-                await _qdrant.InsertChunk(
-                    documentName,
-                    chunks[i],
-                    embeddings[i]
-                );
+                batches.Add(chunks.Skip(i).Take(batchSize).ToList());
             }
+
+            int maxConcurrency = 3; // controlled concurrency for embedding requests
+            var semaphore = new System.Threading.SemaphoreSlim(maxConcurrency);
+            var tasks = new List<Task>();
+
+            for (int b = 0; b < batches.Count; b++)
+            {
+                var batchIndex = b;
+                var batch = batches[b];
+
+                var work = Task.Run(async () =>
+                {
+                    await semaphore.WaitAsync();
+                    try
+                    {
+                        var swBatch = System.Diagnostics.Stopwatch.StartNew();
+                        var embBatch = await _embeddingService.GenerateEmbeddings(batch);
+                        swBatch.Stop();
+                        _logger?.LogInformation("Embedding batch {BatchIndex}: generated {Count} embeddings in {Elapsed}ms", batchIndex, embBatch.Count, swBatch.ElapsedMilliseconds);
+
+                        var points = new List<Qdrant.Client.Grpc.PointStruct>();
+                        for (int j = 0; j < embBatch.Count; j++)
+                        {
+                            var point = new Qdrant.Client.Grpc.PointStruct
+                            {
+                                Id = new Qdrant.Client.Grpc.PointId { Uuid = Guid.NewGuid().ToString() },
+                                Vectors = embBatch[j]
+                            };
+
+                            point.Payload.Add("document", documentName);
+                            point.Payload.Add("content", batch[j]);
+                            points.Add(point);
+                        }
+
+                        var swUpsert = System.Diagnostics.Stopwatch.StartNew();
+                        await _qdrant.BatchUpsertAsync(points);
+                        swUpsert.Stop();
+                        _logger?.LogInformation("Upsert batch {BatchIndex}: upserted {Count} points in {Elapsed}ms", batchIndex, points.Count, swUpsert.ElapsedMilliseconds);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogError(ex, "Error processing embedding batch {BatchIndex}", batchIndex);
+                        throw;
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                });
+
+                tasks.Add(work);
+            }
+
+            await Task.WhenAll(tasks);
+
+            swTotal.Stop();
+            _logger?.LogInformation("Processed document {DocumentName}: totalChunks={Chunks} totalElapsed={Elapsed}ms", documentName, chunks.Count, swTotal.ElapsedMilliseconds);
         }
 
         private bool NeedsRewrite(string question)
@@ -824,559 +1005,3 @@ Assistant:
         }
     }
 }
-
-//finaly working version 
-
-//using LocalRagAPI.Models;
-//using LocalRagAPI.Services;
-//using Microsoft.AspNetCore.Mvc;
-//using System.Text;
-
-//namespace LocalRagAPI.Controllers
-//{
-//    [Route("api/[controller]")]
-//    [ApiController]
-//    public class AITestController : ControllerBase
-//    {
-//        private readonly ILLMService _llm;
-//        private readonly JinaEmbeddingService _embeddingService;
-//        private readonly ChatMemory _memory;
-//        private readonly JinaRerankerService _reranker;
-//        private readonly QdrantService _qdrant;
-
-//        public AITestController(
-//            ILLMService llm,
-//            JinaEmbeddingService embeddingService,
-//            ChatMemory memory,
-//            JinaRerankerService reranker,
-//            QdrantService qdrant)
-//        {
-//            _llm = llm;
-//            _embeddingService = embeddingService;
-//            _memory = memory;
-//            _reranker = reranker;
-//            _qdrant = qdrant;
-//        }
-
-//        [HttpGet]
-//        public async Task<string> Ask()
-//        {
-//            return await _llm.GenerateResponse(
-//                "Explain embeddings in simple terms."
-//            );
-//        }
-
-//        [HttpGet("embed")]
-//        public async Task<int> TestEmbedding()
-//        {
-//            var result = await _embeddingService.GenerateEmbeddings(
-//                new List<string> { "What is refund policy?" });
-
-//            return result[0].Length;
-//        }
-
-//        // =========================
-//        // ASK QUESTION USING RAG
-//        // =========================
-//        [HttpGet("ask-rag")]
-//        public async Task<RagResponse> AskRag(string question)
-//        {
-//            if (string.IsNullOrWhiteSpace(question))
-//                return new RagResponse
-//                {
-//                    Answer = Response,
-//                    Sources = rerankerdChunks.Take(3),
-//                    ToList()
-//                }; "Question cannot be empty.";
-
-//            // =============================
-//            // STEP 1 — FOLLOW-UP CONTEXT
-//            // =============================
-
-//            var history = _memory.BuildConversationHistory();
-
-//            var contextualQuestion = $@"
-//                Conversation History:
-//                {history}
-
-//                User Question:
-//                {question}
-
-//                Rewrite the question so it is clear for document search.
-//                Return only the rewritten question.
-//            ";
-
-//            var rewrittenQuestion = await _llm.GenerateResponse(contextualQuestion);
-
-//            // =============================
-//            // STEP 2 — EMBEDDING SEARCH
-//            // =============================
-
-//            var questionEmbedding = (await _embeddingService
-//                .GenerateEmbeddings(new List<string> { rewrittenQuestion }))[0];
-
-//            // =============================
-//            // STEP 3 — VECTOR SEARCH (QDRANT)
-//            // =============================
-
-//            var candidateChunks = await _qdrant.Search(questionEmbedding);
-
-//            if (!candidateChunks.Any())
-//                return "This question is outside the scope of the uploaded documents.";
-
-//            // =============================
-//            // STEP 4 — RERANK
-//            // =============================
-
-//            var rerankedChunks = await _reranker.Rerank(rewrittenQuestion, candidateChunks);
-
-//            // =============================
-//            // STEP 5 — SOURCE CITATION
-//            // =============================
-
-//            var contextBuilder = new StringBuilder();
-
-//            int sourceIndex = 1;
-
-//            foreach (var chunk in rerankedChunks)
-//            {
-//                contextBuilder.AppendLine($"[Source {sourceIndex}]");
-//                contextBuilder.AppendLine(chunk);
-//                contextBuilder.AppendLine();
-
-//                sourceIndex++;
-//            }
-
-//            var combinedContext = contextBuilder.ToString();
-
-//            // =============================
-//            // STEP 6 — FINAL PROMPT
-//            // =============================
-
-//            var prompt = $@"
-//You are an AI assistant for answering questions from company documents.
-
-//Rules:
-//- Answer ONLY using the provided context.
-//- If the answer is not present say:
-//'I cannot find that information in the uploaded documents.'
-//- Always cite the source number like [Source 1].
-
-//Context:
-//{combinedContext}
-
-//Conversation History:
-//{history}
-
-//Question:
-//{question}
-
-//Provide a clear answer and include source citations.
-//";
-
-//            var response = await _llm.GenerateResponse(prompt);
-
-//            // =============================
-//            // STEP 7 — SAVE MEMORY
-//            // =============================
-
-//            _memory.AddUserMessage(question);
-//            _memory.AddAssistantMessage(response);
-
-//            return response;
-//        }
-
-//        //chat 
-
-//        [HttpGet("chat")]
-//        public async Task<string> Chat(string question, string mode = "rag")
-//        {
-//            if (mode == "chat")
-//            {
-//                return await _llm.GenerateResponse(question);
-//            }
-
-//            return await AskRag(question);
-//        }
-
-//        // =========================
-//        // FILE UPLOAD
-//        // =========================
-//        [HttpPost("upload")]
-//        public async Task<string> UploadFile(IFormFile file)
-//        {
-//            if (file == null || file.Length == 0)
-//                return "Invalid file.";
-
-//            if (file.Length > 5 * 1024 * 1024)
-//                return "File too large. Max 5MB allowed.";
-
-//            string text;
-
-//            try
-//            {
-//                if (file.FileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
-//                {
-//                    using var reader = new StreamReader(file.OpenReadStream());
-//                    text = await reader.ReadToEndAsync();
-//                }
-//                else if (file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
-//                {
-//                    using var stream = file.OpenReadStream();
-//                    using var document = UglyToad.PdfPig.PdfDocument.Open(stream);
-
-//                    var sb = new StringBuilder();
-
-//                    foreach (var page in document.GetPages())
-//                        sb.AppendLine(page.Text);
-
-//                    text = sb.ToString();
-//                }
-//                else
-//                {
-//                    return "Unsupported file type. Only .txt and .pdf allowed.";
-//                }
-
-//                if (string.IsNullOrWhiteSpace(text))
-//                    return "File contains no readable text.";
-//            }
-//            catch (Exception ex)
-//            {
-//                return $"Error reading file: {ex.Message}";
-//            }
-
-//            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-
-//            await ProcessDocument(text, file.FileName);
-
-//            stopwatch.Stop();
-
-//            return $"File processed successfully in {stopwatch.ElapsedMilliseconds} ms";
-//        }
-
-//        // =========================
-//        // DOCUMENT PROCESSING
-//        // =========================
-//        private async Task ProcessDocument(string text, string documentName)
-//        {
-//            var sentences = text
-//                .Split(new[] { ".", "!", "?" },
-//                StringSplitOptions.RemoveEmptyEntries)
-//                .Select(s => s.Trim())
-//                .Where(s => !string.IsNullOrWhiteSpace(s))
-//                .ToList();
-
-//            int chunkSentenceSize = 8;
-//            int overlap = 2;
-//            int maxChunks = 200;
-
-//            var chunks = new List<string>();
-
-//            for (int i = 0; i < sentences.Count; i += (chunkSentenceSize - overlap))
-//            {
-//                if (chunks.Count >= maxChunks)
-//                    break;
-
-//                var chunkSentences = sentences
-//                    .Skip(i)
-//                    .Take(chunkSentenceSize)
-//                    .ToList();
-
-//                if (!chunkSentences.Any())
-//                    break;
-
-//                var chunkText = string.Join(". ", chunkSentences) + ".";
-//                chunks.Add(chunkText);
-//            }
-
-//            var embeddings = await _embeddingService.GenerateEmbeddings(chunks);
-
-//            for (int i = 0; i < chunks.Count; i++)
-//            {
-//                await _qdrant.InsertChunk(
-//                    documentName,
-//                    chunks[i],
-//                    embeddings[i]
-//                );
-//            }
-//        }
-//    }
-//}
-
-
-//working version of single file upload
-
-//using LocalRagAPI.Models;
-//using LocalRagAPI.Services;
-//using Microsoft.AspNetCore.Mvc;
-//using System.Text;
-
-//namespace LocalRagAPI.Controllers
-//{
-//    [Route("api/[controller]")]
-//    [ApiController]
-//    public class AITestController : ControllerBase
-//    {
-//        private readonly ILLMService _llm;
-//        private readonly JinaEmbeddingService _embeddingService;
-//        private readonly VectorStore _store;
-//        private readonly ChatMemory _memory;
-//        private readonly JinaRerankerService _reranker;
-
-//        public AITestController(
-//            ILLMService llm,
-//            JinaEmbeddingService embeddingService,
-//            VectorStore store,
-//            ChatMemory memory,
-//            JinaRerankerService reranker)
-//        {
-//            _llm = llm;
-//            _embeddingService = embeddingService;
-//            _store = store;
-//            _memory = memory;
-//            _reranker = reranker;
-//        }
-
-//        // Basic LLM test
-//        [HttpGet]
-//        public async Task<string> Ask()
-//        {
-//            return await _llm.GenerateResponse(
-//                "Explain embeddings in simple terms."
-//            );
-//        }
-
-//        // Test embedding pipeline
-//        [HttpGet("embed")]
-//        public async Task<int> TestEmbedding()
-//        {
-//            var result = await _embeddingService.GenerateEmbeddings(
-//                new List<string> { "What is refund policy?" });
-
-//            return result[0].Length;
-//        }
-
-//        [HttpGet("seed")]
-//        public async Task<string> Seed()
-//        {
-//            _store.Chunks.Clear();
-
-//            var docs = new[]
-//            {
-//                "Refund policy allows returns within 7 days.",
-//                "Shipping takes 3 to 5 business days.",
-//                "Account password can be reset using email verification."
-//            };
-
-//            var embeddings = await _embeddingService.GenerateEmbeddings(docs.ToList());
-
-//            for (int i = 0; i < docs.Length; i++)
-//            {
-//                _store.Chunks.Add(new DocumentChunk
-//                {
-//                    Content = docs[i],
-//                    Embedding = embeddings[i]
-//                });
-//            }
-
-//            return "Seeded successfully";
-//        }
-
-//        [HttpGet("ask-rag")]
-//        public async Task<string> AskRag(string question)
-//        {
-//            if (string.IsNullOrWhiteSpace(question))
-//                return "Question cannot be empty.";
-
-//            if (!_store.Chunks.Any())
-//                return "No document data available. Upload a file first.";
-
-//            var questionEmbedding = (await _embeddingService
-//                .GenerateEmbeddings(new List<string> { question }))[0];
-
-//            // STEP 1 — Hybrid retrieval
-//            var hybridResults = _store.Chunks
-//                .Select(chunk =>
-//                {
-//                    var vectorScore = VectorStore.CosineSimilarity(questionEmbedding, chunk.Embedding);
-//                    var keywordScore = KeywordScore(question, chunk.Content);
-
-//                    var hybridScore = vectorScore + (keywordScore * 0.15);
-
-//                    return new
-//                    {
-//                        Chunk = chunk,
-//                        Score = hybridScore,
-//                        VectorScore = vectorScore,
-//                        KeywordScore = keywordScore
-//                    };
-//                })
-//                .OrderByDescending(x => x.Score)
-//                .Take(20) // retrieve more candidates
-//                .ToList();
-
-//            float threshold = 0.35f;
-
-//            var candidateChunks = hybridResults
-//                .Where(x => x.VectorScore >= threshold || x.KeywordScore > 0)
-//                .Select(x => x.Chunk.Content)
-//                .ToList();
-
-//            if (!candidateChunks.Any())
-//            {
-//                return "This question is outside the scope of the uploaded documents.";
-//            }
-
-//            // STEP 2 — Rerank with Jina
-//            var rerankedChunks = await _reranker.Rerank(question, candidateChunks);
-
-//            var combinedContext = string.Join("\n", rerankedChunks);
-
-//            var history = _memory.BuildConversationHistory();
-
-//            var prompt = $@"
-//                You are an AI assistant for answering questions from company documents.
-
-//                Rules:
-//                - Use ONLY the provided context.
-//                - If the answer is not present, say:
-//                'I cannot find that information in the uploaded documents.'
-
-//                Context:
-//                {combinedContext}
-
-//                Conversation History:
-//                {history}
-
-//                Question:
-//                {question}
-
-//                Answer clearly and concisely.
-//            ";
-
-//            var response = await _llm.GenerateResponse(prompt);
-
-//            _memory.AddUserMessage(question);
-//            _memory.AddAssistantMessage(response);
-
-//            return response;
-//        }
-
-//        [HttpPost("upload")]
-//        public async Task<string> UploadFile(IFormFile file)
-//        {
-//            _store.Chunks.Clear();
-
-//            if (file == null || file.Length == 0)
-//                return "Invalid file.";
-
-//            if (file.Length > 5 * 1024 * 1024)
-//                return "File too large. Max 5MB allowed.";
-
-//            string text = string.Empty;
-
-//            try
-//            {
-//                if (file.FileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
-//                {
-//                    using var reader = new StreamReader(file.OpenReadStream());
-//                    text = await reader.ReadToEndAsync();
-//                }
-//                else if (file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
-//                {
-//                    using var stream = file.OpenReadStream();
-//                    using var document = UglyToad.PdfPig.PdfDocument.Open(stream);
-
-//                    var sb = new StringBuilder();
-
-//                    foreach (var page in document.GetPages())
-//                    {
-//                        sb.AppendLine(page.Text);
-//                    }
-
-//                    text = sb.ToString();
-//                }
-//                else
-//                {
-//                    return "Unsupported file type. Only .txt and .pdf allowed.";
-//                }
-
-//                if (string.IsNullOrWhiteSpace(text))
-//                    return "File contains no readable text.";
-//            }
-//            catch (Exception ex)
-//            {
-//                return $"Error reading file: {ex.Message}";
-//            }
-
-//            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-
-//            await ProcessDocument(text);
-
-//            stopwatch.Stop();
-
-//            return $"File processed successfully in {stopwatch.ElapsedMilliseconds} ms. Total chunks: {_store.Chunks.Count}";
-//        }
-
-//        private async Task ProcessDocument(string text)
-//        {
-//            var sentences = text
-//                .Split(new[] { ".", "!", "?" },
-//                       StringSplitOptions.RemoveEmptyEntries)
-//                .Select(s => s.Trim())
-//                .Where(s => !string.IsNullOrWhiteSpace(s))
-//                .ToList();
-
-//            int chunkSentenceSize = 8;
-//            int overlap = 2;
-//            int maxChunks = 150;
-
-//            var chunks = new List<string>();
-
-//            for (int i = 0; i < sentences.Count; i += (chunkSentenceSize - overlap))
-//            {
-//                if (chunks.Count >= maxChunks)
-//                    break;
-
-//                var chunkSentences = sentences
-//                    .Skip(i)
-//                    .Take(chunkSentenceSize)
-//                    .ToList();
-
-//                if (!chunkSentences.Any())
-//                    break;
-
-//                var chunkText = string.Join(". ", chunkSentences) + ".";
-//                chunks.Add(chunkText);
-//            }
-
-//            var embeddings = await _embeddingService.GenerateEmbeddings(chunks);
-
-//            for (int i = 0; i < chunks.Count; i++)
-//            {
-//                _store.Chunks.Add(new DocumentChunk
-//                {
-//                    Content = chunks[i],
-//                    Embedding = embeddings[i]
-//                });
-//            }
-//        }
-
-//        private int KeywordScore(string query, string content)
-//        {
-//            var words = query.ToLower().Split(" ");
-
-//            int score = 0;
-
-//            foreach (var word in words)
-//            {
-//                if (content.ToLower().Contains(word))
-//                {
-//                    score++;
-//                }
-//            }
-
-//            return score;
-//        }
-//    }
-//}
