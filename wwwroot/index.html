@@ -1,5 +1,5 @@
 ﻿<!DOCTYPE html>
-<html lang="en" x-data="app()" :class="{ 'dark': darkMode }">
+<html lang="en" x-data="app()" x-init="init()" :class="{ 'dark': darkMode }">
 
 <head>
 
@@ -23,41 +23,70 @@
 
 </head>
 
-<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-[Inter]">
+<body class="font-[Inter] text-\#111827" style="background:#F7F4ED;color:#111827;">
+
+    <!-- Intro / Splash -->
+    <div x-show="showIntro" x-transition:enter="transition ease-out duration-700"
+         x-transition:enter-start="opacity-0 scale-95" x-transition:enter-end="opacity-100 scale-100"
+         class="fixed inset-0 flex items-center justify-center z-50 bg-[rgba(247,244,237,0.95)]">
+
+        <div class="flex flex-col items-center gap-3">
+            <div class="logo-mark text-4xl" style="color:#A16207;">◈</div>
+            <div class="text-2xl font-semibold">Nexora AI</div>
+            <div class="text-sm text-\#6B7280">Transform documents into intelligence</div>
+        </div>
+
+    </div>
 
     <div class="flex h-screen overflow-hidden">
 
         <!-- AUTH VIEWS -->
         <div x-show="!authenticated" class="m-auto w-full max-w-md p-6">
-            <div class="bg-white p-6 rounded shadow dark:bg-slate-800">
+            <div class="bg-white p-6 rounded-xl shadow-lg" style="border:1px solid #E7E0D5;">
                 <template x-if="authView === 'login'">
                     <div>
-                        <h2 class="text-lg font-semibold mb-4">Sign in</h2>
+                        <div class="flex flex-col items-center mb-4">
+                            <div class="logo-mark text-3xl" style="color:#A16207">◈</div>
+                            <h2 class="text-xl font-semibold mt-2">Nexora AI</h2>
+                            <div class="text-sm text-\#6B7280">Transform documents into intelligence</div>
+                        </div>
+
                         <div class="mb-3">
-                            <input x-model="auth.email" placeholder="Email" class="w-full p-2 border rounded" />
+                            <input x-model="auth.email" placeholder="Email" class="w-full p-3 rounded-lg border" />
                         </div>
                         <div class="mb-3">
-                            <input x-model="auth.password" type="password" placeholder="Password" class="w-full p-2 border rounded" />
+                            <input x-model="auth.password" type="password" placeholder="Password" class="w-full p-3 rounded-lg border" />
                         </div>
-                        <div class="flex gap-2">
-                            <button @click="login()" class="px-4 py-2 bg-indigo-500 text-white rounded">Sign in</button>
-                            <button @click="authView='register'" class="px-4 py-2 bg-gray-200 rounded">Register</button>
+                        <div class="flex gap-3">
+                            <button @click="login()" class="flex-1 px-4 py-2 rounded-lg text-white" style="background:#A16207;" :class="{ 'opacity-60 cursor-not-allowed': authLoading }">
+                                <span x-show="!authLoading">Sign in</span>
+                                <span x-show="authLoading">Signing in...</span>
+                            </button>
+                            <button @click="authView='register'" class="px-4 py-2 bg-gray-100 rounded-lg">Register</button>
                         </div>
                     </div>
                 </template>
 
                 <template x-if="authView === 'register'">
                     <div>
-                        <h2 class="text-lg font-semibold mb-4">Register</h2>
+                        <div class="flex flex-col items-center mb-4">
+                            <div class="logo-mark text-3xl" style="color:#A16207">◈</div>
+                            <h2 class="text-xl font-semibold mt-2">Create account</h2>
+                            <div class="text-sm text-\#6B7280">Start using Nexora AI</div>
+                        </div>
+
                         <div class="mb-3">
-                            <input x-model="auth.email" placeholder="Email" class="w-full p-2 border rounded" />
+                            <input x-model="auth.email" placeholder="Email" class="w-full p-3 rounded-lg border" />
                         </div>
                         <div class="mb-3">
-                            <input x-model="auth.password" type="password" placeholder="Password" class="w-full p-2 border rounded" />
+                            <input x-model="auth.password" type="password" placeholder="Password" class="w-full p-3 rounded-lg border" />
                         </div>
-                        <div class="flex gap-2">
-                            <button @click="register()" class="px-4 py-2 bg-indigo-500 text-white rounded">Create account</button>
-                            <button @click="authView='login'" class="px-4 py-2 bg-gray-200 rounded">Back</button>
+                        <div class="flex gap-3">
+                            <button @click="register()" class="flex-1 px-4 py-2 rounded-lg text-white" style="background:#A16207;" :class="{ 'opacity-60 cursor-not-allowed': authLoading }">
+                                <span x-show="!authLoading">Create account</span>
+                                <span x-show="authLoading">Creating...</span>
+                            </button>
+                            <button @click="authView='login'" class="px-4 py-2 bg-gray-100 rounded-lg">Back</button>
                         </div>
                     </div>
                 </template>
@@ -67,58 +96,46 @@
 
         <!-- SIDEBAR -->
 
-        <div x-show="authenticated" class="w-64 bg-white/70 dark:bg-slate-800/80 backdrop-blur border-r border-slate-200 dark:border-slate-700 flex flex-col">
+        <div x-show="authenticated" class="w-72 bg-white" style="border-right:1px solid #E7E0D5;">
 
-            <div class="p-5 text-lg font-semibold flex items-center gap-2">
-                🤖 AI Assistant
+            <div class="p-6 flex items-center gap-3">
+                <div class="logo-mark text-2xl" style="color:#A16207">◈</div>
+                <div>
+                    <div class="font-semibold text-lg">Nexora AI</div>
+                    <div class="text-xs text-\#6B7280">Document AI</div>
+                </div>
             </div>
 
             <!-- SESSIONS -->
             <div class="px-4">
-                <div class="flex items-center justify-between mt-2">
-                    <h3 class="text-xs uppercase text-gray-400">Chats</h3>
-                    <button @click="createSession()" class="text-xs px-2 py-1 bg-indigo-500 text-white rounded">New</button>
+                <div class="flex items-center justify-between">
+                    <h3 class="text-xs uppercase text-\#6B7280">Chats</h3>
+                    <button @click="createSession()" class="text-xs px-2 py-1 rounded" style="background:#A16207;color:white">New</button>
                 </div>
 
-                <div class="mt-3 space-y-1 max-h-48 overflow-auto">
+                <div class="mt-3 space-y-2 max-h-64 overflow-auto">
 
                     <template x-for="s in sessions" :key="s.id">
 
-                        <div class="px-3 py-2 rounded hover:bg-slate-100 dark:hover:bg-slate-700"
-                             :class="selectedSessionId === s.id ? 'bg-indigo-500 text-white' : ''">
+                        <div class="session-item p-3 rounded-lg flex items-start justify-between cursor-pointer"
+                             :class="selectedSessionId === s.id ? 'bg-\#FFF4E6 border-l-4 border-\#A16207' : 'hover:bg-white/60'">
 
-                            <div class="flex justify-between items-center">
+                            <div @click="selectSession(s)" class="flex-1">
+                                <div class="text-sm font-medium" x-text="s.title || 'Chat'"></div>
+                                <div class="text-xs text-\#6B7280" x-text="new Date(s.createdAt).toLocaleString()"></div>
+                            </div>
 
-                                <!-- session title -->
-                                <div @click="selectSession(s)" class="cursor-pointer flex-1">
-                                    <div class="text-sm" x-text="s.title || 'Chat'"></div>
-                                    <div class="text-xs text-gray-400"
-                                         x-text="new Date(s.createdAt).toLocaleString()"></div>
-                                </div>
-
-                                <!-- action buttons -->
-                                <div class="flex gap-1 ml-2">
-
-                                    <button @click.stop="renameSession(s)"
-                                            class="text-xs px-2 py-1 bg-gray-200 dark:bg-slate-600 rounded">
-                                        Rename
-                                    </button>
-
-                                    <button @click.stop="deleteSession(s)"
-                                            class="text-xs px-2 py-1 bg-red-500 text-white rounded">
-                                        Delete
-                                    </button>
-
-                                </div>
-
+                            <div class="actions opacity-0 hover:opacity-100 ml-3 flex gap-2">
+                                <button @click.stop="renameSession(s)" title="Rename" class="text-\#6B7280">✎</button>
+                                <button @click.stop="deleteSession(s)" title="Delete" class="text-red-500">🗑</button>
                             </div>
 
                         </div>
 
                     </template>
 
-                    <div x-show="sessions.length === 0" class="text-xs text-gray-400">
-                        No chats yet
+                    <div x-show="sessions.length === 0" class="text-xs text-\#6B7280">
+                        Start a new conversation with Nexora AI
                     </div>
 
                 </div>
@@ -188,18 +205,13 @@
 
             <div class="p-4">
 
-                <div class="upload-card"
-                     @click="$refs.fileInput.click()"
-                     @dragover.prevent
-                     @drop.prevent="handleDrop">
+                <div class="upload-card p-6 flex flex-col items-center rounded-lg" style="border:2px dashed #E7E0D5;background:#fff;" @click="$refs.fileInput.click()" @dragover.prevent @drop.prevent="handleDrop">
 
-                    <p class="text-sm text-center">Drag & Drop PDF</p>
-                    <p class="text-xs text-center text-gray-400">or click to upload</p>
+                    <div class="text-2xl" style="color:#A16207">📄</div>
+                    <p class="text-sm text-center mt-2">Drag & Drop PDF or click to upload</p>
+                    <p class="text-xs text-\#6B7280">We will index and surface answers from your document</p>
 
-                    <input type="file"
-                           x-ref="fileInput"
-                           class="hidden"
-                           @change="uploadFile">
+                    <input type="file" x-ref="fileInput" class="hidden" @change="uploadFile">
 
                 </div>
 
@@ -207,12 +219,11 @@
 
                 <div x-show="uploading" class="mt-3">
 
-                    <div class="text-xs text-indigo-500 mb-1" x-text="uploadMessage"></div>
+                    <div class="text-xs text-\#A16207 mb-1" x-text="uploadMessage"></div>
 
-                    <div class="w-full bg-gray-200 rounded-full h-2 dark:bg-gray-700">
+                    <div class="w-full bg-\#F3ECE1 rounded-full h-3" style="border:1px solid #E7E0D5;">
 
-                        <div class="bg-indigo-500 h-2 rounded-full transition-all duration-500"
-                             :style="'width:' + uploadProgress + '%'"></div>
+                        <div class="h-3 rounded-full transition-all duration-500" style="background:#A16207;" :style="'width:' + uploadProgress + '%'"></div>
 
                     </div>
 
@@ -224,39 +235,35 @@
 
             <div class="px-4 flex-1 overflow-y-auto">
 
-                <h3 class="text-xs uppercase text-gray-400 mb-2">
+                <h3 class="text-xs uppercase text-\#6B7280 mb-2">
                     Documents
                 </h3>
 
-                <div class="text-xs text-gray-400 mb-3">
+                <div class="text-xs text-\#6B7280 mb-3">
                     Click a document to query only that file
                 </div>
 
                 <template x-for="doc in documents">
 
-                    <div class="doc-item flex justify-between items-center"
-                         :class="selectedDoc === doc ? 'bg-indigo-500 text-white' : ''"
-                         @click="selectDocument(doc)">
+                    <div class="doc-item flex justify-between items-center p-3 bg-white rounded-lg border" style="border:1px solid #E7E0D5;margin-bottom:8px;" @click="selectDocument(doc)">
 
-                        <span x-text="doc"></span>
+                        <div>
+                            <div class="text-sm font-medium" x-text="doc"></div>
+                            <div class="text-xs text-\#6B7280">Uploaded</div>
+                        </div>
 
-                        <span x-show="selectedDoc === doc">
-                            ✔
-                        </span>
-
-                        <button @click.stop="deleteDocument(doc)"
-                                class="text-red-400 hover:text-red-600 text-xs ml-2">
-                            🗑
-                        </button>
+                        <div class="flex items-center gap-2">
+                            <button @click.stop="deleteDocument(doc)" class="text-red-500">Delete</button>
+                            <div x-show="selectedDoc === doc" class="text-\#A16207">Selected</div>
+                        </div>
 
                     </div>
 
                 </template>
 
-                <div x-show="documents.length === 0"
-                     class="text-xs text-gray-400">
+                <div x-show="documents.length === 0" class="text-xs text-\#6B7280">
 
-                    No documents uploaded
+                    Upload a document to begin asking questions
 
                 </div>
 
@@ -270,51 +277,42 @@
 
             <!-- HEADER -->
 
-            <div class="flex justify-between items-center px-6 py-3 border-b border-slate-200 dark:border-slate-700">
-
-                <div class="flex items-center gap-3">
-
-                    <h2 class="font-semibold text-lg">
-                        AI Knowledge Assistant
-                    </h2>
-
-                    <div class="text-xs text-green-500 flex items-center gap-1">
-                        ● AI Online
-                    </div>
-
-                </div>
+            <div class="flex justify-between items-center px-6 py-4" style="border-bottom:1px solid #E7E0D5;">
 
                 <div class="flex items-center gap-4">
+                    <button @click="toggleSidebar()" class="p-2 rounded-md" style="background:transparent;border:1px solid transparent;">☰</button>
+                    <div>
+                        <h2 class="font-semibold text-lg">Nexora AI</h2>
+                        <div class="text-xs text-\#6B7280">AI Online</div>
+                    </div>
+                </div>
 
-                    <button @click="toggleTheme" class="theme-btn">
-                        🌙
-                    </button>
-
+                <div class="flex items-center gap-3">
+                    <button @click="toggleTheme" class="theme-btn">🌙</button>
                     <template x-if="authenticated">
-                        <button @click="logout()" class="px-3 py-1 bg-gray-200 rounded">Logout</button>
+                        <button @click="logout()" class="px-3 py-1 rounded-lg" style="background:#fff;border:1px solid #E7E0D5;">Logout</button>
                     </template>
-
                 </div>
 
             </div>
 
             <!-- CHAT -->
 
-            <div id="chatContainer" class="flex-1 overflow-y-auto p-6 space-y-6">
+            <div id="chatContainer" class="flex-1 overflow-y-auto p-6 space-y-6" style="scroll-behavior:smooth;">
 
                 <template x-for="(msg, index) in messages" :key="index">
 
-                    <div :class="msg.role==='user' ? 'text-right message-row':''">
+                    <div class="message-row" :class="msg.role==='user' ? 'justify-end' : 'justify-start'">
 
-                        <div :class="msg.role==='user' ? 'user-bubble' : 'ai-bubble'">
+                        <div :class="msg.role==='user' ? 'user-bubble' : 'ai-bubble'" x-transition:enter="transition ease-out duration-200" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
 
                             <!-- MESSAGE -->
                             <div class="message-body">
                                 <div class="markdown-body prose" x-html="renderMessage(msg.content || '')"></div>
 
-                                <div class="msg-meta mt-2 flex items-center gap-2">
+                                <div class="msg-meta mt-3 flex items-center gap-3">
                                     <template x-if="msg.timestamp">
-                                        <span class="text-xs text-gray-400" x-text="(new Date(msg.timestamp)).toLocaleTimeString()"></span>
+                                        <span class="text-xs text-\#6B7280" x-text="(new Date(msg.timestamp)).toLocaleTimeString()"></span>
                                     </template>
 
                                     <template x-if="msg.sources && msg.sources.length > 0">
@@ -324,6 +322,10 @@
                                             </template>
                                         </div>
                                     </template>
+
+                                    <div class="ml-2">
+                                        <button @click="copyMessage(msg)" class="text-xs text-\#6B7280">Copy</button>
+                                    </div>
                                 </div>
                             </div>
 

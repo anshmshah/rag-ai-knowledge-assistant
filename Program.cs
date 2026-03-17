@@ -64,9 +64,12 @@ builder.Services.AddScoped<LocalRagAPI.Services.DocumentProcessor>();
 builder.Services.AddHostedService<LocalRagAPI.Services.DocumentIngestionWorker>();
 
 // -------- Phase1: EF Core (Postgres) and Auth wiring (optional) --------
-var connectionString = builder.Configuration.GetConnectionString("Default")
-                       ?? builder.Configuration["ConnectionStrings:Default"]
-                       ?? "Host=localhost;Database=localrag;Username=postgres;Password=ansh";
+var connectionString = builder.Configuration.GetConnectionString("Default");
+
+if (string.IsNullOrEmpty(connectionString))
+{
+    throw new Exception("Database connection string is not configured.");
+}
 
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
     options.UseNpgsql(connectionString));
@@ -81,9 +84,18 @@ var authEnabled = builder.Configuration.GetValue<bool>("Auth:Enabled", false);
 
 if (authEnabled)
 {
-    var jwtKey = builder.Configuration["Jwt:Key"] ?? "THIS_IS_A_SUPER_SECRET_KEY_FOR_LOCAL_RAG_API_2026_123456";
-    var issuer = builder.Configuration["Jwt:Issuer"] ?? "localrag";
-    var audience = builder.Configuration["Jwt:Audience"] ?? "localrag";
+    var jwtKey = builder.Configuration["Jwt:Key"];
+    var issuer = builder.Configuration["Jwt:Issuer"];
+    var audience = builder.Configuration["Jwt:Audience"];
+
+    if (string.IsNullOrEmpty(jwtKey))
+        throw new Exception("JWT Key is not configured.");
+
+    if (string.IsNullOrEmpty(issuer))
+        throw new Exception("JWT Issuer is not configured.");
+
+    if (string.IsNullOrEmpty(audience))
+        throw new Exception("JWT Audience is not configured.");
 
     builder.Services.AddAuthentication(options =>
     {

@@ -3,6 +3,8 @@
     return {
 
         darkMode: false,
+        showIntro: true,
+        authLoading: false,
         mode: "rag",
         question: "",
         authenticated: false,
@@ -51,6 +53,11 @@
             } else {
                 this.authenticated = false;
             }
+
+            // intro animation hide after load
+            setTimeout(() => {
+                this.showIntro = false
+            }, 1200)
 
 
 
@@ -109,6 +116,7 @@
                 const body = await res.json();
                 if (body.token) {
                     localStorage.setItem('token', body.token);
+                    this.authLoading = false
                     // clear any previous client state
                     this.clearClientState();
                     this.authenticated = true;
@@ -120,6 +128,7 @@
             catch (e) {
                 console.error('Login error', e);
                 alert('Login failed');
+                this.authLoading = false
             }
         },
 
@@ -131,6 +140,7 @@
                 return;
             }
 
+            this.authLoading = true
             try {
                 const res = await fetch('/api/auth/register', {
                     method: 'POST',
@@ -146,10 +156,12 @@
 
                 // auto login after successful registration
                 await this.login();
+                this.authLoading = false
             }
             catch (e) {
                 console.error('Register error', e);
                 alert('Registration failed');
+                this.authLoading = false
             }
         },
 
@@ -304,6 +316,17 @@
                 this.darkMode ? "dark" : "light"
             )
 
+        },
+
+        toggleSidebar() {
+            // placeholder for potential sidebar collapse in future
+        },
+
+        copyMessage(msg) {
+            try {
+                const text = msg.content || '';
+                navigator.clipboard.writeText(text);
+            } catch (e) { console.error(e) }
         },
 
 
