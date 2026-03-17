@@ -15,19 +15,20 @@ namespace LocalRagAPI.Services
         {
             _logger = logger;
 
-            var url = config["Qdrant:Url"];
+            var host = config["Qdrant:Host"];
+            var port = int.Parse(config["Qdrant:Port"] ?? "6334");
             var apiKey = config["Qdrant:ApiKey"];
 
-            if (string.IsNullOrEmpty(url))
-                throw new Exception("Qdrant URL is not configured");
+            if (string.IsNullOrEmpty(host))
+                throw new Exception("Qdrant host not configured");
 
             if (string.IsNullOrEmpty(apiKey))
-                throw new Exception("Qdrant API key is not configured");
+                throw new Exception("Qdrant API key not configured");
 
             _recreateOnStartup = config.GetValue<bool>("Qdrant:RecreateOnStartup", false);
 
-            // ✅ Correct for Qdrant Cloud
-            _client = new QdrantClient(new Uri(url), apiKey);
+            // ✅ gRPC WITH API KEY
+            _client = new QdrantClient(host, port, apiKey: apiKey);
         }
 
         // =========================
