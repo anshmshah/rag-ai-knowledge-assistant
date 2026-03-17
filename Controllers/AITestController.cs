@@ -952,24 +952,32 @@ Assistant:
                         swBatch.Stop();
                         _logger?.LogInformation("Embedding batch {BatchIndex}: generated {Count} embeddings in {Elapsed}ms", batchIndex, embBatch.Count, swBatch.ElapsedMilliseconds);
 
-                        var points = new List<Qdrant.Client.Grpc.PointStruct>();
+                        var items = new List<(string content, string document, float[] vector)>();
+
                         for (int j = 0; j < embBatch.Count; j++)
                         {
-                            var point = new Qdrant.Client.Grpc.PointStruct
-                            {
-                                Id = new Qdrant.Client.Grpc.PointId { Uuid = Guid.NewGuid().ToString() },
-                                Vectors = embBatch[j]
-                            };
-
-                            point.Payload.Add("document", documentName);
-                            point.Payload.Add("content", batch[j]);
-                            points.Add(point);
+                            items.Add((batch[j], documentName, embBatch[j]));
                         }
 
-                        var swUpsert = System.Diagnostics.Stopwatch.StartNew();
-                        await _qdrant.BatchUpsertAsync(points);
-                        swUpsert.Stop();
-                        _logger?.LogInformation("Upsert batch {BatchIndex}: upserted {Count} points in {Elapsed}ms", batchIndex, points.Count, swUpsert.ElapsedMilliseconds);
+                        await _qdrant.BatchUpsertAsync(items);
+                        //var points = new List<Qdrant.Client.Grpc.PointStruct>();
+                        //for (int j = 0; j < embBatch.Count; j++)
+                        //{
+                        //    var point = new Qdrant.Client.Grpc.PointStruct
+                        //    {
+                        //        Id = new Qdrant.Client.Grpc.PointId { Uuid = Guid.NewGuid().ToString() },
+                        //        Vectors = embBatch[j]
+                        //    };
+
+                        //    point.Payload.Add("document", documentName);
+                        //    point.Payload.Add("content", batch[j]);
+                        //    points.Add(point);
+                        //}
+
+                        //var swUpsert = System.Diagnostics.Stopwatch.StartNew();
+                        //await _qdrant.BatchUpsertAsync(points);
+                        //swUpsert.Stop();
+                        //_logger?.LogInformation("Upsert batch {BatchIndex}: upserted {Count} points in {Elapsed}ms", batchIndex, points.Count, swUpsert.ElapsedMilliseconds);
                     }
                     catch (Exception ex)
                     {
