@@ -1,7 +1,5 @@
-﻿using System.Net;
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using LocalRagAPI.Models;
 
 namespace LocalRagAPI.Services
@@ -15,17 +13,11 @@ namespace LocalRagAPI.Services
 
         private const string COLLECTION = "documents";
 
-        private static readonly JsonSerializerOptions JsonOptions = new()
-        {
-            PropertyNameCaseInsensitive = true,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-        };
-
         public QdrantService(ILogger<QdrantService> logger, IConfiguration config)
         {
             _logger = logger;
 
-            _url = (config["Qdrant:Url"] ?? "").Trim().TrimEnd('/');
+            _url = config["Qdrant:Url"]?.TrimEnd('/');
             _apiKey = config["Qdrant:ApiKey"];
 
             if (string.IsNullOrWhiteSpace(_url))
@@ -38,9 +30,6 @@ namespace LocalRagAPI.Services
             _httpClient.DefaultRequestHeaders.Add("api-key", _apiKey);
         }
 
-        // =========================
-        // CREATE COLLECTION
-        // =========================
         public async Task InitializeCollection()
         {
             var res = await _httpClient.GetAsync($"{_url}/collections/{COLLECTION}");
@@ -96,10 +85,7 @@ namespace LocalRagAPI.Services
                 "application/json"
             );
 
-            var response = await _httpClient.PutAsync(
-                $"{_url}/collections/{COLLECTION}/index",
-                content
-            );
+            var response = await _httpClient.PutAsync($"{_url}/collections/{COLLECTION}/index", content);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -117,33 +103,27 @@ namespace LocalRagAPI.Services
             _logger.LogInformation("Qdrant payload index ensured for field '{FieldName}'", fieldName);
         }
 
-        // =========================
-        // UPSERT POINTS
-        // =========================
-        public async Task BatchUpsertAsync(List<(string content, string document, float[] vector, string? userId, string? documentId)> items)
+        public async Task BatchUpsertAsync(List<(string content, string document, float[] vector, string userId, string documentId)> items)
         {
-            if (items == null || items.Count == 0)
-                return;
-
             await InitializeCollection();
 
             var points = items.Select(i => new
             {
                 id = Guid.NewGuid().ToString(),
                 vector = i.vector,
-                payload = new Dictionary<string, object?>
+                payload = new Dictionary<string, object>
                 {
                     ["content"] = i.content,
                     ["document"] = i.document,
-                    ["user_id"] = string.IsNullOrWhiteSpace(i.userId) ? null : i.userId,
-                    ["document_id"] = string.IsNullOrWhiteSpace(i.documentId) ? null : i.documentId
+                    ["user_id"] = i.userId ?? "",
+                    ["document_id"] = i.documentId ?? ""
                 }
-            }).ToList();
+            });
 
             var body = new { points };
 
             var contentJson = new StringContent(
-                JsonSerializer.Serialize(body, JsonOptions),
+                JsonSerializer.Serialize(body),
                 Encoding.UTF8,
                 "application/json"
             );
@@ -156,33 +136,28 @@ namespace LocalRagAPI.Services
                 throw new Exception($"Upsert failed: {err}");
             }
 
-            _logger.LogInformation("Inserted {Count} points into Qdrant", items.Count);
+            _logger.LogInformation("Inserted {Count} points", items.Count);
         }
 
-        // =========================
-        // HAS POINTS
-        // =========================
         public async Task<bool> HasPointsAsync(string? doc = null, string? userId = null)
         {
             await InitializeCollection();
 
-            var filter = BuildFilter(doc, userId);
-
             var body = new
             {
-                filter,
+                filter = BuildFilterObject(doc, userId),
                 limit = 1,
                 with_payload = false,
                 with_vector = false
             };
 
-            var json = new StringContent(
-                JsonSerializer.Serialize(body, JsonOptions),
+            var content = new StringContent(
+                JsonSerializer.Serialize(body, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }),
                 Encoding.UTF8,
                 "application/json"
             );
 
-            var res = await _httpClient.PostAsync($"{_url}/collections/{COLLECTION}/points/scroll", json);
+            var res = await _httpClient.PostAsync($"{_url}/collections/{COLLECTION}/points/scroll", content);
 
             if (!res.IsSuccessStatusCode)
             {
@@ -190,15 +165,18 @@ namespace LocalRagAPI.Services
                 throw new Exception($"HasPoints failed: {err}");
             }
 
-            var raw = await res.Content.ReadAsStringAsync();
-            var parsed = JsonSerializer.Deserialize<QdrantScrollResponse>(raw, JsonOptions);
+            var json = await res.Content.ReadAsStringAsync();
+            using var docJson = JsonDocument.Parse(json);
 
-            return parsed?.Result?.Points != null && parsed.Result.Points.Count > 0;
+            if (!docJson.RootElement.TryGetProperty("result", out var result))
+                return false;
+
+            if (!result.TryGetProperty("points", out var points))
+                return false;
+
+            return points.ValueKind == JsonValueKind.Array && points.GetArrayLength() > 0;
         }
 
-        // =========================
-        // VECTOR SEARCH
-        // =========================
         public async Task<List<SearchResultItem>> Search(float[] embedding, string? doc = null, int limit = 20, string? userId = null)
         {
             await InitializeCollection();
@@ -206,19 +184,19 @@ namespace LocalRagAPI.Services
             var body = new
             {
                 vector = embedding,
-                limit,
+                limit = limit,
                 with_payload = true,
                 with_vector = false,
-                filter = BuildFilter(doc, userId)
+                filter = BuildFilterObject(doc, userId)
             };
 
-            var json = new StringContent(
-                JsonSerializer.Serialize(body, JsonOptions),
+            var content = new StringContent(
+                JsonSerializer.Serialize(body, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }),
                 Encoding.UTF8,
                 "application/json"
             );
 
-            var res = await _httpClient.PostAsync($"{_url}/collections/{COLLECTION}/points/search", json);
+            var res = await _httpClient.PostAsync($"{_url}/collections/{COLLECTION}/points/search", content);
 
             if (!res.IsSuccessStatusCode)
             {
@@ -226,51 +204,68 @@ namespace LocalRagAPI.Services
                 throw new Exception($"Search failed: {err}");
             }
 
-            var raw = await res.Content.ReadAsStringAsync();
-            var parsed = JsonSerializer.Deserialize<QdrantSearchResponse>(raw, JsonOptions);
+            var json = await res.Content.ReadAsStringAsync();
+            using var docJson = JsonDocument.Parse(json);
 
-            if (parsed?.Result == null)
-                return new List<SearchResultItem>();
+            var output = new List<SearchResultItem>();
 
-            return parsed.Result.Select(r => new SearchResultItem
+            if (!docJson.RootElement.TryGetProperty("result", out var result) || result.ValueKind != JsonValueKind.Array)
+                return output;
+
+            foreach (var item in result.EnumerateArray())
             {
-                Content = ReadPayloadString(r.Payload, "content"),
-                Document = ReadPayloadString(r.Payload, "document"),
-                Score = r.Score,
-                PointId = r.Id.ToString()
-            }).ToList();
+                string contentText = "";
+                string documentName = "";
+                float score = 0;
+                string pointId = "";
+
+                if (item.TryGetProperty("payload", out var payload))
+                {
+                    if (payload.TryGetProperty("content", out var contentProp) && contentProp.ValueKind == JsonValueKind.String)
+                        contentText = contentProp.GetString() ?? "";
+
+                    if (payload.TryGetProperty("document", out var documentProp) && documentProp.ValueKind == JsonValueKind.String)
+                        documentName = documentProp.GetString() ?? "";
+                }
+
+                if (item.TryGetProperty("score", out var scoreProp))
+                {
+                    if (scoreProp.ValueKind == JsonValueKind.Number)
+                        score = scoreProp.GetSingle();
+                }
+
+                if (item.TryGetProperty("id", out var idProp))
+                {
+                    if (idProp.ValueKind == JsonValueKind.String)
+                        pointId = idProp.GetString() ?? "";
+                    else
+                        pointId = idProp.ToString();
+                }
+
+                output.Add(new SearchResultItem
+                {
+                    Content = contentText,
+                    Document = documentName,
+                    Score = score,
+                    PointId = pointId
+                });
+            }
+
+            return output;
         }
 
-        // =========================
-        // KEYWORD SEARCH
-        // =========================
         public async Task<List<SearchResultItem>> KeywordSearch(string query, string? doc = null, int limit = 20, string? userId = null)
         {
             await InitializeCollection();
 
             var must = new List<object>();
 
-            if (!string.IsNullOrWhiteSpace(query))
-            {
-                must.Add(new
-                {
-                    key = "content",
-                    match = new
-                    {
-                        text = query
-                    }
-                });
-            }
-
             if (!string.IsNullOrWhiteSpace(doc))
             {
                 must.Add(new
                 {
                     key = "document",
-                    match = new
-                    {
-                        value = doc
-                    }
+                    match = new { value = doc }
                 });
             }
 
@@ -279,28 +274,25 @@ namespace LocalRagAPI.Services
                 must.Add(new
                 {
                     key = "user_id",
-                    match = new
-                    {
-                        value = userId
-                    }
+                    match = new { value = userId }
                 });
             }
 
             var body = new
             {
-                filter = new { must },
-                limit,
+                filter = must.Count > 0 ? new { must } : null,
+                limit = limit,
                 with_payload = true,
                 with_vector = false
             };
 
-            var json = new StringContent(
-                JsonSerializer.Serialize(body, JsonOptions),
+            var content = new StringContent(
+                JsonSerializer.Serialize(body, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }),
                 Encoding.UTF8,
                 "application/json"
             );
 
-            var res = await _httpClient.PostAsync($"{_url}/collections/{COLLECTION}/points/scroll", json);
+            var res = await _httpClient.PostAsync($"{_url}/collections/{COLLECTION}/points/scroll", content);
 
             if (!res.IsSuccessStatusCode)
             {
@@ -308,32 +300,66 @@ namespace LocalRagAPI.Services
                 throw new Exception($"KeywordSearch failed: {err}");
             }
 
-            var raw = await res.Content.ReadAsStringAsync();
-            var parsed = JsonSerializer.Deserialize<QdrantScrollResponse>(raw, JsonOptions);
+            var json = await res.Content.ReadAsStringAsync();
+            using var docJson = JsonDocument.Parse(json);
 
-            if (parsed?.Result?.Points == null)
-                return new List<SearchResultItem>();
+            var output = new List<SearchResultItem>();
 
-            return parsed.Result.Points.Select(r => new SearchResultItem
+            if (!docJson.RootElement.TryGetProperty("result", out var result))
+                return output;
+
+            if (!result.TryGetProperty("points", out var points) || points.ValueKind != JsonValueKind.Array)
+                return output;
+
+            foreach (var item in points.EnumerateArray())
             {
-                Content = ReadPayloadString(r.Payload, "content"),
-                Document = ReadPayloadString(r.Payload, "document"),
-                Score = 0,
-                PointId = r.Id.ToString()
-            }).ToList();
+                string contentText = "";
+                string documentName = "";
+                string pointId = "";
+
+                if (item.TryGetProperty("payload", out var payload))
+                {
+                    if (payload.TryGetProperty("content", out var contentProp) && contentProp.ValueKind == JsonValueKind.String)
+                        contentText = contentProp.GetString() ?? "";
+
+                    if (payload.TryGetProperty("document", out var documentProp) && documentProp.ValueKind == JsonValueKind.String)
+                        documentName = documentProp.GetString() ?? "";
+                }
+
+                if (!string.IsNullOrWhiteSpace(query) &&
+                    !contentText.Contains(query, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (item.TryGetProperty("id", out var idProp))
+                {
+                    if (idProp.ValueKind == JsonValueKind.String)
+                        pointId = idProp.GetString() ?? "";
+                    else
+                        pointId = idProp.ToString();
+                }
+
+                output.Add(new SearchResultItem
+                {
+                    Content = contentText,
+                    Document = documentName,
+                    Score = 0,
+                    PointId = pointId
+                });
+            }
+
+            return output;
         }
 
-        // =========================
-        // DELETE
-        // =========================
-        public async Task DeleteByDocumentAsync(string name)
+        public Task DeleteByDocumentAsync(string name)
         {
-            await DeleteByFilterAsync(name, null);
+            return DeleteByFilterAsync(name, null);
         }
 
-        public async Task DeleteByDocumentAndUserAsync(string name, string userId)
+        public Task DeleteByDocumentAndUserAsync(string name, string userId)
         {
-            await DeleteByFilterAsync(name, userId);
+            return DeleteByFilterAsync(name, userId);
         }
 
         private async Task DeleteByFilterAsync(string? doc, string? userId)
@@ -342,18 +368,18 @@ namespace LocalRagAPI.Services
 
             var body = new
             {
-                filter = BuildFilter(doc, userId)
+                filter = BuildFilterObject(doc, userId)
             };
 
-            var json = new StringContent(
-                JsonSerializer.Serialize(body, JsonOptions),
+            var content = new StringContent(
+                JsonSerializer.Serialize(body, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }),
                 Encoding.UTF8,
                 "application/json"
             );
 
             var request = new HttpRequestMessage(HttpMethod.Post, $"{_url}/collections/{COLLECTION}/points/delete")
             {
-                Content = json
+                Content = content
             };
 
             var res = await _httpClient.SendAsync(request);
@@ -363,12 +389,11 @@ namespace LocalRagAPI.Services
                 var err = await res.Content.ReadAsStringAsync();
                 throw new Exception($"Delete failed: {err}");
             }
+
+            _logger.LogInformation("Deleted Qdrant points for doc={Doc} userId={UserId}", doc, userId);
         }
 
-        // =========================
-        // FILTER BUILDER
-        // =========================
-        private object? BuildFilter(string? doc, string? userId)
+        private object? BuildFilterObject(string? doc, string? userId)
         {
             var must = new List<object>();
 
@@ -377,10 +402,7 @@ namespace LocalRagAPI.Services
                 must.Add(new
                 {
                     key = "document",
-                    match = new
-                    {
-                        value = doc
-                    }
+                    match = new { value = doc }
                 });
             }
 
@@ -389,10 +411,7 @@ namespace LocalRagAPI.Services
                 must.Add(new
                 {
                     key = "user_id",
-                    match = new
-                    {
-                        value = userId
-                    }
+                    match = new { value = userId }
                 });
             }
 
@@ -400,63 +419,6 @@ namespace LocalRagAPI.Services
                 return null;
 
             return new { must };
-        }
-
-        private static string ReadPayloadString(Dictionary<string, JsonElement>? payload, string key)
-        {
-            if (payload == null || !payload.TryGetValue(key, out var value))
-                return string.Empty;
-
-            return value.ValueKind switch
-            {
-                JsonValueKind.String => value.GetString() ?? string.Empty,
-                JsonValueKind.Number => value.ToString(),
-                JsonValueKind.True => "true",
-                JsonValueKind.False => "false",
-                _ => value.ToString()
-            };
-        }
-
-        // =========================
-        // RESPONSE DTOs
-        // =========================
-        private class QdrantSearchResponse
-        {
-            [JsonPropertyName("result")]
-            public List<QdrantPointSearchResult>? Result { get; set; }
-        }
-
-        private class QdrantPointSearchResult
-        {
-            [JsonPropertyName("id")]
-            public JsonElement Id { get; set; }
-
-            [JsonPropertyName("score")]
-            public float Score { get; set; }
-
-            [JsonPropertyName("payload")]
-            public Dictionary<string, JsonElement>? Payload { get; set; }
-        }
-
-        private class QdrantScrollResponse
-        {
-            [JsonPropertyName("result")]
-            public QdrantScrollResult? Result { get; set; }
-        }
-
-        private class QdrantScrollResult
-        {
-            [JsonPropertyName("points")]
-            public List<QdrantPointScrollResult>? Points { get; set; }
-        }
-
-        private class QdrantPointScrollResult
-        {
-            [JsonPropertyName("id")]
-            public JsonElement Id { get; set; }
-
-            [JsonPropertyName("payload")]
-            public Dictionary<string, JsonElement>? Payload { get; set; }
         }
     }
 }
