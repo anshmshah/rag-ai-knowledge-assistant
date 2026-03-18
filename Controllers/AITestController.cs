@@ -952,11 +952,23 @@ Assistant:
                         swBatch.Stop();
                         _logger?.LogInformation("Embedding batch {BatchIndex}: generated {Count} embeddings in {Elapsed}ms", batchIndex, embBatch.Count, swBatch.ElapsedMilliseconds);
 
-                        var items = new List<(string content, string document, float[] vector)>();
+                        var items = new List<(string content, string document, float[] vector, string userId, string documentId)>();
+
+                        // ⚠️ IMPORTANT: since this method doesn't have userId/documentId,
+                        // we pass null (or you can pass actual values if available)
+
+                        string userId = null;
+                        string documentId = null;
 
                         for (int j = 0; j < embBatch.Count; j++)
                         {
-                            items.Add((batch[j], documentName, embBatch[j]));
+                            items.Add((
+                                content: batch[j],
+                                document: documentName,
+                                vector: embBatch[j],
+                                userId: userId,
+                                documentId: documentId
+                            ));
                         }
 
                         await _qdrant.BatchUpsertAsync(items);

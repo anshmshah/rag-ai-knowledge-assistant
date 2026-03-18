@@ -67,16 +67,28 @@ namespace LocalRagAPI.Services
                     b, embBatch.Count, sw.ElapsedMilliseconds);
 
                 // ✅ NEW STRUCTURE (NO gRPC)
-                var items = new List<(string content, string document, float[] vector)>();
+                var items = new List<(string content, string document, float[] vector, string userId, string documentId)>();
 
                 for (int j = 0; j < embBatch.Count; j++)
                 {
                     items.Add((
                         content: batch[j],
                         document: documentName,
-                        vector: embBatch[j]
+                        vector: embBatch[j],
+                        userId: request.UserId?.ToString(),
+                        documentId: request.DocumentId?.ToString()
                     ));
                 }
+                //var items = new List<(string content, string document, float[] vector)>();
+
+                //for (int j = 0; j < embBatch.Count; j++)
+                //{
+                //    items.Add((
+                //        content: batch[j],
+                //        document: documentName,
+                //        vector: embBatch[j]
+                //    ));
+                //}
 
                 var swUpsert = System.Diagnostics.Stopwatch.StartNew();
 

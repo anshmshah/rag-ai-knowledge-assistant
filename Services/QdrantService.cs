@@ -71,16 +71,18 @@ namespace LocalRagAPI.Services
         // =========================
         // UPSERT POINTS (MAIN)
         // =========================
-        public async Task BatchUpsertAsync(List<(string content, string document, float[] vector)> items)
+        public async Task BatchUpsertAsync(List<(string content, string document, float[] vector, string userId, string documentId)> items)
         {
             var points = items.Select(i => new
             {
                 id = Guid.NewGuid().ToString(),
                 vector = i.vector,
-                payload = new
+                payload = new Dictionary<string, object>
                 {
-                    content = i.content,
-                    document = i.document
+                    ["content"] = i.content,
+                    ["document"] = i.document,
+                    ["user_id"] = i.userId ?? "",
+                    ["document_id"] = i.documentId ?? ""
                 }
             });
 
