@@ -45,25 +45,49 @@ namespace LocalRagAPI.Services
         {
             var res = await _httpClient.GetAsync($"{_url}/collections/{COLLECTION}");
 
-            if (res.IsSuccessStatusCode)
+            if (!res.IsSuccessStatusCode)
+            {
+                var body = new
+                {
+                    vectors = new
+                    {
+                        size = 768,
+                        distance = "Cosine"
+                    }
+                };
+
+                var content = new StringContent(
+                    JsonSerializer.Serialize(body),
+                    Encoding.UTF8,
+                    "application/json"
+                );
+
+                var create = await _httpClient.PutAsync($"{_url}/collections/{COLLECTION}", content);
+
+                if (!create.IsSuccessStatusCode)
+                {
+                    var err = await create.Content.ReadAsStringAsync();
+                    throw new Exception($"Collection creation failed: {err}");
+                }
+
+                _logger.LogInformation("Qdrant collection '{Collection}' created", COLLECTION);
+            }
+            else
             {
                 _logger.LogInformation("Qdrant collection '{Collection}' already exists", COLLECTION);
-                return;
             }
 
-            if (res.StatusCode != HttpStatusCode.NotFound)
-            {
-                var err = await res.Content.ReadAsStringAsync();
-                throw new Exception($"Failed checking collection: {err}");
-            }
+            await EnsurePayloadIndexAsync("document", "keyword");
+            await EnsurePayloadIndexAsync("user_id", "keyword");
+            await EnsurePayloadIndexAsync("document_id", "keyword");
+        }
 
+        private async Task EnsurePayloadIndexAsync(string fieldName, string fieldSchema)
+        {
             var body = new
             {
-                vectors = new
-                {
-                    size = 768,
-                    distance = "Cosine"
-                }
+                field_name = fieldName,
+                field_schema = fieldSchema
             };
 
             var content = new StringContent(
@@ -72,15 +96,25 @@ namespace LocalRagAPI.Services
                 "application/json"
             );
 
-            var create = await _httpClient.PutAsync($"{_url}/collections/{COLLECTION}", content);
+            var response = await _httpClient.PutAsync(
+                $"{_url}/collections/{COLLECTION}/index",
+                content
+            );
 
-            if (!create.IsSuccessStatusCode)
+            if (!response.IsSuccessStatusCode)
             {
-                var err = await create.Content.ReadAsStringAsync();
-                throw new Exception($"Collection creation failed: {err}");
+                var err = await response.Content.ReadAsStringAsync();
+
+                if (err.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogInformation("Qdrant payload index already exists for field '{FieldName}'", fieldName);
+                    return;
+                }
+
+                throw new Exception($"Failed to create payload index for '{fieldName}': {err}");
             }
 
-            _logger.LogInformation("Qdrant collection '{Collection}' created successfully", COLLECTION);
+            _logger.LogInformation("Qdrant payload index ensured for field '{FieldName}'", fieldName);
         }
 
         // =========================
