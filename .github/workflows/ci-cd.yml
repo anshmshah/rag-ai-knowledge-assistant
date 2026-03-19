@@ -25,10 +25,10 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Restore dependencies
-        run: dotnet restore ./LocalRagAPI/LocalRagAPI.csproj
+        run: dotnet restore ./LocalRagAPI.csproj
 
       - name: Build project
-        run: dotnet build ./LocalRagAPI/LocalRagAPI.csproj --configuration Release --no-restore
+        run: dotnet build ./LocalRagAPI.csproj --configuration Release --no-restore
 
       - name: Publish project
-        run: dotnet publish ./LocalRagAPI/LocalRagAPI.csproj --configuration Release --output ./publish --no-build
+        run: dotnet publish ./LocalRagAPI.csproj --configuration Release --output ./publish --no-build
