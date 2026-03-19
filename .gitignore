@@ -13,3 +13,7 @@ obj/
 # OS files
 .DS_Store
 Thumbs.db
+
+uploads/
+*.pdf
+*.csproj.user

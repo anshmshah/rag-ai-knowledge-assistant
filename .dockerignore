@@ -2,4 +2,7 @@ bin/
 obj/
 .git/
 .vs/
+uploads/
+*.pdf
+*.csproj.user
 README.md
