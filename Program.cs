@@ -155,8 +155,6 @@ if (authEnabled.Value)
 
 // -------------------- BUILD APP --------------------
 
-ModelTestService.TestModel();
-
 var app = builder.Build();
 
 // -------------------- MIDDLEWARE --------------------
