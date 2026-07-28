@@ -17,3 +17,6 @@ Thumbs.db
 uploads/
 *.pdf
 *.csproj.user
+
+
+.vs/
