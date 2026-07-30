@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using LocalRagAPI.Repositories;
 using System.Linq;
+using LocalRagAPI.Services;
 
 namespace LocalRagAPI.Controllers
 {
@@ -11,10 +12,12 @@ namespace LocalRagAPI.Controllers
     public class DocumentsController : ControllerBase
     {
         private readonly IDocumentRepository _docs;
+        private readonly DocumentDeletionService _deletionService;
 
-        public DocumentsController(IDocumentRepository docs)
+        public DocumentsController(IDocumentRepository docs, DocumentDeletionService deletionService)
         {
             _docs = docs;
+            _deletionService = deletionService;
         }
 
         private Guid GetCurrentUserId()
@@ -39,6 +42,28 @@ namespace LocalRagAPI.Controllers
 
             var result = list.Select(d => new { id = d.Id, fileName = d.FileName, uploadedAt = d.UploadedAt });
             return Ok(result);
+        }
+
+        // DELETE /api/documents/{id}
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> Delete(Guid id)
+        {
+            var userId = GetCurrentUserId();
+            if (userId == Guid.Empty)
+            {
+                return Unauthorized();
+            }
+
+            var (success, message, statusCode) = await _deletionService.DeleteDocumentAsync(id, userId);
+
+            if (!success)
+            {
+                if (statusCode == 404) return NotFound();
+                if (statusCode == 403) return Forbid();
+                return StatusCode(statusCode, new { message });
+            }
+
+            return Ok(new { success = true, message = "Document deleted successfully." });
         }
     }
 }

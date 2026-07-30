@@ -1,4 +1,4 @@
-using LocalRagAPI.Services;
+ï»¿using LocalRagAPI.Services;
 using LocalRagAPI.Data;
 using LocalRagAPI.Repositories;
 using Microsoft.EntityFrameworkCore;
@@ -86,6 +86,7 @@ builder.Services.AddScoped<IDocumentRepository, DocumentRepository>();
 builder.Services.AddScoped<IChatSessionRepository, ChatSessionRepository>();
 builder.Services.AddScoped<IMessageRepository, MessageRepository>();
 builder.Services.AddScoped<IQueryLogRepository, QueryLogRepository>();
+builder.Services.AddScoped<LocalRagAPI.Services.DocumentDeletionService>();
 
 // -------------------- AUTH --------------------
 
@@ -179,7 +180,7 @@ var app = builder.Build();
 app.UseMiddleware<LocalRagAPI.Middleware.ErrorHandlingMiddleware>();
 app.UseMiddleware<LocalRagAPI.Middleware.RequestLoggingMiddleware>();
 
-// Safe Qdrant init (won’t crash app)
+// Safe Qdrant init (wonï¿½t crash app)
 using (var scope = app.Services.CreateScope())
 {
     var qdrant = scope.ServiceProvider.GetRequiredService<QdrantService>();
