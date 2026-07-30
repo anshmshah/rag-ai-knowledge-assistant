@@ -79,7 +79,19 @@ namespace LocalRagAPI.Controllers
 
         // GET /api/documents/{id}/preview
         [HttpGet("{id}/preview")]
-        public async Task<IActionResult> Preview(Guid id)
+        public Task<IActionResult> Preview(Guid id)
+        {
+            return GetDocumentFileResultAsync(id, isDownload: false);
+        }
+
+        // GET /api/documents/{id}/download
+        [HttpGet("{id}/download")]
+        public Task<IActionResult> Download(Guid id)
+        {
+            return GetDocumentFileResultAsync(id, isDownload: true);
+        }
+
+        private async Task<IActionResult> GetDocumentFileResultAsync(Guid id, bool isDownload)
         {
             var userId = GetCurrentUserId();
             if (userId == Guid.Empty)
@@ -100,7 +112,8 @@ namespace LocalRagAPI.Controllers
 
             if (!doc.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
             {
-                return BadRequest(new { message = "Preview is only supported for PDF files." });
+                var operation = isDownload ? "Download" : "Preview";
+                return BadRequest(new { message = $"{operation} is only supported for PDF files." });
             }
 
             if (string.IsNullOrEmpty(doc.FilePath) || !System.IO.File.Exists(doc.FilePath))
@@ -117,10 +130,18 @@ namespace LocalRagAPI.Controllers
                 return StatusCode(403, new { message = "Invalid file path." });
             }
 
-            _logger.LogInformation("Successfully previewed document {DocumentId}", id);
+            if (isDownload)
+            {
+                _logger.LogInformation("Successfully downloaded document {DocumentId}", id);
+                Response.Headers.Append("Content-Disposition", $"attachment; filename=\"{doc.FileName}\"");
+            }
+            else
+            {
+                _logger.LogInformation("Successfully previewed document {DocumentId}", id);
+                Response.Headers.Append("Content-Disposition", $"inline; filename=\"{doc.FileName}\"");
+            }
 
             Response.Headers.Append("Cache-Control", "private, no-cache");
-            Response.Headers.Append("Content-Disposition", $"inline; filename=\"{doc.FileName}\"");
             
             var stream = new FileStream(resolvedFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
             return File(stream, "application/pdf", enableRangeProcessing: true);
