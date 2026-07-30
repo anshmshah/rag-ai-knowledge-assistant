@@ -3,7 +3,10 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using LocalRagAPI.Repositories;
 using System.Linq;
+using System.IO;
 using LocalRagAPI.Services;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace LocalRagAPI.Controllers
 {
@@ -13,11 +16,19 @@ namespace LocalRagAPI.Controllers
     {
         private readonly IDocumentRepository _docs;
         private readonly DocumentDeletionService _deletionService;
+        private readonly IWebHostEnvironment _env;
+        private readonly ILogger<DocumentsController> _logger;
 
-        public DocumentsController(IDocumentRepository docs, DocumentDeletionService deletionService)
+        public DocumentsController(
+            IDocumentRepository docs, 
+            DocumentDeletionService deletionService,
+            IWebHostEnvironment env,
+            ILogger<DocumentsController> logger)
         {
             _docs = docs;
             _deletionService = deletionService;
+            _env = env;
+            _logger = logger;
         }
 
         private Guid GetCurrentUserId()
@@ -64,6 +75,55 @@ namespace LocalRagAPI.Controllers
             }
 
             return Ok(new { success = true, message = "Document deleted successfully." });
+        }
+
+        // GET /api/documents/{id}/preview
+        [HttpGet("{id}/preview")]
+        public async Task<IActionResult> Preview(Guid id)
+        {
+            var userId = GetCurrentUserId();
+            if (userId == Guid.Empty)
+            {
+                return Unauthorized();
+            }
+
+            var doc = await _docs.GetByIdAsync(id);
+            if (doc == null)
+            {
+                return NotFound(new { message = "Document not found." });
+            }
+
+            if (doc.UserId != userId)
+            {
+                return StatusCode(403, new { message = "Unauthorized access to document." });
+            }
+
+            if (!doc.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                return BadRequest(new { message = "Preview is only supported for PDF files." });
+            }
+
+            if (string.IsNullOrEmpty(doc.FilePath) || !System.IO.File.Exists(doc.FilePath))
+            {
+                return NotFound(new { message = "File not found on disk." });
+            }
+
+            var uploadsRoot = Path.GetFullPath(Path.Combine(_env.ContentRootPath, "uploads"));
+            var resolvedFilePath = Path.GetFullPath(doc.FilePath);
+            
+            if (!resolvedFilePath.StartsWith(uploadsRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning("Path traversal attempt detected for document {DocumentId}", id);
+                return StatusCode(403, new { message = "Invalid file path." });
+            }
+
+            _logger.LogInformation("Successfully previewed document {DocumentId}", id);
+
+            Response.Headers.Append("Cache-Control", "private, no-cache");
+            Response.Headers.Append("Content-Disposition", $"inline; filename=\"{doc.FileName}\"");
+            
+            var stream = new FileStream(resolvedFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            return File(stream, "application/pdf", enableRangeProcessing: true);
         }
     }
 }
