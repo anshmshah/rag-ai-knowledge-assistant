@@ -10,5 +10,6 @@ namespace LocalRagAPI.Models
         public string FilePath { get; set; }
         public DateTime UploadedAt { get; set; } = DateTime.UtcNow;
         public DateTime? DeletedAt { get; set; }
+        public string Sha256Hash { get; set; }
     }
 }

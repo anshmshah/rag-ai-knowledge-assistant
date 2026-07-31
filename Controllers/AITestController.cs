@@ -1,4 +1,4 @@
-﻿using Azure;
+using Azure;
 using Google.Protobuf.WellKnownTypes;
 using LLama.Batched;
 using LocalRagAPI.Models;
@@ -39,6 +39,7 @@ namespace LocalRagAPI.Controllers
         private readonly IChatSessionRepository _chatSessionRepository;
         private readonly IMessageRepository _messageRepository;
         private readonly IQueryLogRepository _queryLogRepository;
+        private readonly FileHashService _fileHashService;
 
         public AITestController(
             ILLMService llm,
@@ -52,7 +53,8 @@ namespace LocalRagAPI.Controllers
             IWebHostEnvironment env,
             IChatSessionRepository chatSessionRepository,
             IMessageRepository messageRepository,
-            IQueryLogRepository queryLogRepository)
+            IQueryLogRepository queryLogRepository,
+            FileHashService fileHashService)
         {
             _llm = llm;
             _embeddingService = embeddingService;
@@ -66,6 +68,7 @@ namespace LocalRagAPI.Controllers
             _chatSessionRepository = chatSessionRepository;
             _messageRepository = messageRepository;
             _queryLogRepository = queryLogRepository;
+            _fileHashService = fileHashService;
         }
 
         private Guid GetCurrentUserId()
@@ -767,6 +770,36 @@ Assistant:
             if (file.Length > 5 * 1024 * 1024)
                 return "File too large. Max 5MB allowed.";
 
+            string fileHash;
+            try
+            {
+                using var stream = file.OpenReadStream();
+                fileHash = await _fileHashService.ComputeSha256Async(stream);
+                _logger?.LogInformation("Generated SHA-256 hash for uploaded file {FileName}: {HashPrefix}...", file.FileName, fileHash.Substring(0, 8));
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to generate SHA-256 hash for file {FileName}", file.FileName);
+                return StatusCode(500, "Internal server error during file processing.");
+            }
+
+            // Determine user ownership
+            Guid finalUserId = Guid.Empty;
+            if (User?.Identity?.IsAuthenticated == true)
+            {
+                var sub = User.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+                          ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+
+                if (Guid.TryParse(sub, out var parsed)) finalUserId = parsed;
+            }
+
+            var existingByHash = await _documentRepository.GetByHashAsync(finalUserId, fileHash);
+            if (existingByHash != null)
+            {
+                _logger?.LogWarning("Duplicate document detected. User {UserId} attempted to upload a file with hash {Hash}", finalUserId, fileHash);
+                return Conflict("This document already exists.");
+            }
+
             string text;
 
             try
@@ -818,28 +851,11 @@ Assistant:
 
             jobStore?.AddJob(job);
 
-            // Determine user ownership. If authenticated use claim, otherwise use Guid.Empty as "local" user
-            Guid finalUserId = Guid.Empty;
-            if (User?.Identity?.IsAuthenticated == true)
-            {
-                var sub = User.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
-                          ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
-
-                if (Guid.TryParse(sub, out var parsed)) finalUserId = parsed;
-            }
-
-            // Persist file on disk under /uploads/{userId}/{documentId}.{ext}
-            // Prevent creating duplicate active document with same filename for the same user
-            var existing = await _documentRepository.GetByFileNameAsync(file.FileName);
-            if (existing != null && existing.UserId == finalUserId)
-            {
-                return Conflict($"A non-deleted document with name '{file.FileName}' already exists.");
-            }
-
             var docEntity = new LocalRagAPI.Models.Document
             {
                 UserId = finalUserId,
-                FileName = file.FileName
+                FileName = file.FileName,
+                Sha256Hash = fileHash
             };
 
             var uploadsRoot = Path.Combine(_env.ContentRootPath, "uploads");
@@ -864,7 +880,25 @@ Assistant:
             }
 
             docEntity.FilePath = diskPath;
-            await _documentRepository.CreateAsync(docEntity);
+
+            try
+            {
+                await _documentRepository.CreateAsync(docEntity);
+            }
+            catch (Microsoft.EntityFrameworkCore.DbUpdateException ex)
+            {
+                _logger?.LogWarning(ex, "Unique constraint violation or concurrent insert for document hash {Hash} by user {UserId}", fileHash, finalUserId);
+                
+                // Clean up the orphaned physical file
+                try
+                {
+                    if (System.IO.File.Exists(diskPath))
+                        System.IO.File.Delete(diskPath);
+                }
+                catch { }
+
+                return Conflict("This document already exists.");
+            }
 
             var request = new LocalRagAPI.Models.DocumentIngestionRequest
             {

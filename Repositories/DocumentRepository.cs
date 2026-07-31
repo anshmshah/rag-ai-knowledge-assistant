@@ -32,6 +32,11 @@ namespace LocalRagAPI.Repositories
             return await _db.Set<Document>().FirstOrDefaultAsync(d => d.FileName == filename && d.DeletedAt == null);
         }
 
+        public async Task<Document> GetByHashAsync(Guid userId, string hash)
+        {
+            return await _db.Set<Document>().FirstOrDefaultAsync(d => d.UserId == userId && d.Sha256Hash == hash && d.DeletedAt == null);
+        }
+
         public async Task<IEnumerable<Document>> ListByUserAsync(Guid userId)
         {
             return await _db.Set<Document>()

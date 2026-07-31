@@ -1,4 +1,4 @@
-﻿using LocalRagAPI.Services;
+using LocalRagAPI.Services;
 using LocalRagAPI.Data;
 using LocalRagAPI.Repositories;
 using Microsoft.EntityFrameworkCore;
@@ -87,6 +87,7 @@ builder.Services.AddScoped<IChatSessionRepository, ChatSessionRepository>();
 builder.Services.AddScoped<IMessageRepository, MessageRepository>();
 builder.Services.AddScoped<IQueryLogRepository, QueryLogRepository>();
 builder.Services.AddScoped<LocalRagAPI.Services.DocumentDeletionService>();
+builder.Services.AddSingleton<LocalRagAPI.Services.FileHashService>();
 
 // -------------------- AUTH --------------------
 

@@ -12,5 +12,6 @@ namespace LocalRagAPI.Repositories
         Task<IEnumerable<Document>> ListByUserAsync(Guid userId);
         Task MarkDeletedAsync(Guid id);
         Task<Document> GetByFileNameAsync(string filename);
+        Task<Document> GetByHashAsync(Guid userId, string hash);
     }
 }

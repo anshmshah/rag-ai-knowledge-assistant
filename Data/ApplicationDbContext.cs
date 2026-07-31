@@ -34,6 +34,10 @@ namespace LocalRagAPI.Data
                 b.Property(d => d.FileName).IsRequired();
                 b.Property(d => d.UserId).IsRequired();
                 b.Property(d => d.FilePath).IsRequired();
+                
+                b.HasIndex(d => new { d.UserId, d.Sha256Hash })
+                 .IsUnique()
+                 .HasFilter("\"DeletedAt\" IS NULL");
             });
 
             modelBuilder.Entity<ChatSession>(b =>

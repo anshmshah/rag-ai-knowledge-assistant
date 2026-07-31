@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using Microsoft.EntityFrameworkCore.Migrations;
 
 #nullable disable
@@ -11,11 +11,12 @@ namespace LocalRagAPI.Migrations
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
         {
-            migrationBuilder.AddColumn<DateTime>(
-                name: "DeletedAt",
-                table: "ChatSessions",
-                type: "timestamp with time zone",
-                nullable: true);
+            // Duplicate migration: column already added in AddSessionDeletedAt
+            // migrationBuilder.AddColumn<DateTime>(
+            //     name: "DeletedAt",
+            //     table: "ChatSessions",
+            //     type: "timestamp with time zone",
+            //     nullable: true);
         }
 
         /// <inheritdoc />
