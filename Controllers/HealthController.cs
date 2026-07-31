@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc;
 
 namespace LocalRagAPI.Controllers
 {
@@ -6,15 +6,27 @@ namespace LocalRagAPI.Controllers
     [Route("api/[controller]")]
     public class HealthController : ControllerBase
     {
-        [HttpGet]
-        public IActionResult Get()
+        private readonly LocalRagAPI.Services.HealthService _healthService;
+
+        public HealthController(LocalRagAPI.Services.HealthService healthService)
         {
-            return Ok(new
+            _healthService = healthService;
+        }
+
+        [HttpGet]
+        [Microsoft.AspNetCore.Authorization.AllowAnonymous]
+        public async Task<IActionResult> Get()
+        {
+            var health = await _healthService.GetHealthAsync();
+            
+            var status = health.GetType().GetProperty("status")?.GetValue(health)?.ToString();
+            
+            if (status == "Unhealthy")
             {
-                status = "Healthy",
-                timestamp = DateTime.UtcNow,
-                version = "2.0.0"
-            });
+                return StatusCode(503, health);
+            }
+
+            return Ok(health);
         }
     }
 }

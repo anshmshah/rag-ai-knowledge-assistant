@@ -30,6 +30,13 @@ namespace LocalRagAPI.Services
             _httpClient.DefaultRequestHeaders.Add("api-key", _apiKey);
         }
 
+        public async Task<bool> PingAsync()
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var res = await _httpClient.GetAsync($"{_url}/collections", cts.Token);
+            return res.IsSuccessStatusCode;
+        }
+
         public async Task InitializeCollection()
         {
             var res = await _httpClient.GetAsync($"{_url}/collections/{COLLECTION}");

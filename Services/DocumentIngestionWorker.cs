@@ -12,22 +12,27 @@ namespace LocalRagAPI.Services
         private readonly IngestionJobStore _jobStore;
         private readonly IServiceProvider _serviceProvider;
         private readonly ILogger<DocumentIngestionWorker> _logger;
+        private readonly WorkerStatus _workerStatus;
 
-        public DocumentIngestionWorker(DocumentIngestionQueue queue, IngestionJobStore jobStore, IServiceProvider serviceProvider, ILogger<DocumentIngestionWorker> logger)
+        public DocumentIngestionWorker(DocumentIngestionQueue queue, IngestionJobStore jobStore, IServiceProvider serviceProvider, ILogger<DocumentIngestionWorker> logger, WorkerStatus workerStatus)
         {
             _queue = queue;
             _jobStore = jobStore;
             _serviceProvider = serviceProvider;
             _logger = logger;
+            _workerStatus = workerStatus;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _logger.LogInformation("DocumentIngestionWorker started");
+            _workerStatus.IsRunning = true;
 
-            await foreach (var request in _queue.Reader.ReadAllAsync(stoppingToken))
+            try
             {
-                var jobId = request.JobId;
+                await foreach (var request in _queue.Reader.ReadAllAsync(stoppingToken))
+                {
+                    var jobId = request.JobId;
                 try
                 {
                     _logger.LogInformation("Starting ingestion job {JobId} for document {Doc}", jobId, request.DocumentName);
@@ -51,6 +56,12 @@ namespace LocalRagAPI.Services
                     _logger.LogError(ex, "Job {JobId} failed", jobId);
                     _jobStore.MarkFailed(jobId, ex.Message);
                 }
+            }
+            }
+            finally
+            {
+                _workerStatus.IsRunning = false;
+                _logger.LogInformation("DocumentIngestionWorker stopped");
             }
         }
     }

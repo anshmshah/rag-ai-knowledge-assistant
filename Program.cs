@@ -59,6 +59,7 @@ builder.Services.AddSingleton<VectorStore>();
 builder.Services.AddSingleton<ChatMemory>();
 builder.Services.AddSingleton<QdrantService>();
 builder.Services.AddSingleton<PromptBuilderService>();
+builder.Services.AddSingleton<LocalRagAPI.Models.WorkerStatus>();
 
 // -------------------- BACKGROUND SERVICES --------------------
 
@@ -88,6 +89,7 @@ builder.Services.AddScoped<IMessageRepository, MessageRepository>();
 builder.Services.AddScoped<IQueryLogRepository, QueryLogRepository>();
 builder.Services.AddScoped<LocalRagAPI.Services.DocumentDeletionService>();
 builder.Services.AddSingleton<LocalRagAPI.Services.FileHashService>();
+builder.Services.AddScoped<LocalRagAPI.Services.HealthService>();
 
 // -------------------- AUTH --------------------
 
