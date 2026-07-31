@@ -90,6 +90,8 @@ builder.Services.AddScoped<IQueryLogRepository, QueryLogRepository>();
 builder.Services.AddScoped<LocalRagAPI.Services.DocumentDeletionService>();
 builder.Services.AddSingleton<LocalRagAPI.Services.FileHashService>();
 builder.Services.AddScoped<LocalRagAPI.Services.HealthService>();
+builder.Services.AddScoped<LocalRagAPI.Services.DocumentUploadService>();
+builder.Services.AddScoped<LocalRagAPI.Services.DemoKnowledgeBaseService>();
 
 // -------------------- AUTH --------------------
 

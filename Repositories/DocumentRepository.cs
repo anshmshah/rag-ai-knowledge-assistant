@@ -45,6 +45,15 @@ namespace LocalRagAPI.Repositories
                 .ToListAsync();
         }
 
+        public async Task<List<string>> GetExistingHashesAsync(Guid userId, IEnumerable<string> hashes)
+        {
+            var hashList = hashes.ToList();
+            return await _db.Set<Document>()
+                .Where(d => d.UserId == userId && d.DeletedAt == null && hashList.Contains(d.Sha256Hash))
+                .Select(d => d.Sha256Hash)
+                .ToListAsync();
+        }
+
         public async Task MarkDeletedAsync(Guid id)
         {
             var d = await _db.Set<Document>().FirstOrDefaultAsync(x => x.Id == id);

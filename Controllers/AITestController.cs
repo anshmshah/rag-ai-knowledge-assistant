@@ -767,23 +767,6 @@ Assistant:
             if (file == null || file.Length == 0)
                 return "Invalid file.";
 
-            if (file.Length > 5 * 1024 * 1024)
-                return "File too large. Max 5MB allowed.";
-
-            string fileHash;
-            try
-            {
-                using var stream = file.OpenReadStream();
-                fileHash = await _fileHashService.ComputeSha256Async(stream);
-                _logger?.LogInformation("Generated SHA-256 hash for uploaded file {FileName}: {HashPrefix}...", file.FileName, fileHash.Substring(0, 8));
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex, "Failed to generate SHA-256 hash for file {FileName}", file.FileName);
-                return StatusCode(500, "Internal server error during file processing.");
-            }
-
-            // Determine user ownership
             Guid finalUserId = Guid.Empty;
             if (User?.Identity?.IsAuthenticated == true)
             {
@@ -793,134 +776,22 @@ Assistant:
                 if (Guid.TryParse(sub, out var parsed)) finalUserId = parsed;
             }
 
-            var existingByHash = await _documentRepository.GetByHashAsync(finalUserId, fileHash);
-            if (existingByHash != null)
+            var uploadService = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.DocumentUploadService)) as LocalRagAPI.Services.DocumentUploadService;
+            if (uploadService == null)
+                return StatusCode(500, "Upload service not configured.");
+
+            using var stream = file.OpenReadStream();
+            var result = await uploadService.UploadAsync(stream, file.FileName, finalUserId, file.Length);
+
+            if (!result.IsSuccess)
             {
-                _logger?.LogWarning("Duplicate document detected. User {UserId} attempted to upload a file with hash {Hash}", finalUserId, fileHash);
-                return Conflict("This document already exists.");
-            }
-
-            string text;
-
-            try
-            {
-                if (file.FileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
-                {
-                    using var reader = new StreamReader(file.OpenReadStream());
-                    text = await reader.ReadToEndAsync();
-                }
-                else if (file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
-                {
-                    using var stream = file.OpenReadStream();
-                    using var document = UglyToad.PdfPig.PdfDocument.Open(stream);
-
-                    var sb = new StringBuilder();
-
-                    foreach (var page in document.GetPages())
-                        sb.AppendLine(page.Text);
-
-                    text = sb.ToString();
-                }
+                if (result.Status == "Duplicate")
+                    return Conflict(result.Message);
                 else
-                {
-                    return "Unsupported file type. Only .txt and .pdf allowed.";
-                }
-
-                if (string.IsNullOrWhiteSpace(text))
-                    return "File contains no readable text.";
-            }
-            catch (Exception ex)
-            {
-                return $"Error reading file: {ex.Message}";
+                    return BadRequest(result.Message);
             }
 
-            // Create ingestion job metadata
-            var jobId = Guid.NewGuid().ToString();
-
-            var job = new LocalRagAPI.Models.IngestionJobStatus
-            {
-                JobId = jobId,
-                State = LocalRagAPI.Models.IngestionJobState.Queued,
-                CreatedAt = DateTime.UtcNow,
-                CompletedBatches = 0,
-                TotalBatches = 0
-            };
-
-            var jobStore = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.IngestionJobStore)) as LocalRagAPI.Services.IngestionJobStore;
-            var queue = HttpContext.RequestServices.GetService(typeof(LocalRagAPI.Services.DocumentIngestionQueue)) as LocalRagAPI.Services.DocumentIngestionQueue;
-
-            jobStore?.AddJob(job);
-
-            var docEntity = new LocalRagAPI.Models.Document
-            {
-                UserId = finalUserId,
-                FileName = file.FileName,
-                Sha256Hash = fileHash
-            };
-
-            var uploadsRoot = Path.Combine(_env.ContentRootPath, "uploads");
-            var userFolder = Path.Combine(uploadsRoot, finalUserId.ToString());
-            Directory.CreateDirectory(userFolder);
-
-            var ext = Path.GetExtension(file.FileName) ?? string.Empty;
-            var diskFileName = docEntity.Id.ToString() + ext;
-            var diskPath = Path.Combine(userFolder, diskFileName);
-
-            try
-            {
-                await using (var fs = new FileStream(diskPath, FileMode.Create))
-                {
-                    await file.CopyToAsync(fs);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex, "Failed to save uploaded file");
-                return StatusCode(500, "Failed to save uploaded file");
-            }
-
-            docEntity.FilePath = diskPath;
-
-            try
-            {
-                await _documentRepository.CreateAsync(docEntity);
-            }
-            catch (Microsoft.EntityFrameworkCore.DbUpdateException ex)
-            {
-                _logger?.LogWarning(ex, "Unique constraint violation or concurrent insert for document hash {Hash} by user {UserId}", fileHash, finalUserId);
-                
-                // Clean up the orphaned physical file
-                try
-                {
-                    if (System.IO.File.Exists(diskPath))
-                        System.IO.File.Delete(diskPath);
-                }
-                catch { }
-
-                return Conflict("This document already exists.");
-            }
-
-            var request = new LocalRagAPI.Models.DocumentIngestionRequest
-            {
-                JobId = jobId,
-                DocumentName = file.FileName,
-                Text = text,
-                FileName = file.FileName,
-                DocumentId = docEntity.Id,
-                UserId = docEntity.UserId
-            };
-
-            // try enqueue with short timeout
-            var enqueued = await queue.EnqueueAsync(request, TimeSpan.FromSeconds(5));
-
-            if (!enqueued)
-            {
-                jobStore?.MarkFailed(jobId, "Queue is full");
-                return StatusCode(429, "Server busy, try again later.");
-            }
-
-            // return 202 with job id and document id
-            return Accepted(new { jobId, documentId = docEntity.Id });
+            return Accepted(new { jobId = result.JobId, documentId = result.DocumentId });
         }
 
         private async Task ProcessDocument(string text, string documentName)

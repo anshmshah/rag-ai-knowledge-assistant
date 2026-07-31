@@ -13,5 +13,6 @@ namespace LocalRagAPI.Repositories
         Task MarkDeletedAsync(Guid id);
         Task<Document> GetByFileNameAsync(string filename);
         Task<Document> GetByHashAsync(Guid userId, string hash);
+        Task<List<string>> GetExistingHashesAsync(Guid userId, IEnumerable<string> hashes);
     }
 }
