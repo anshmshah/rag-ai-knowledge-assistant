@@ -24,7 +24,11 @@ namespace LocalRagAPI.Repositories
 
         public async Task<IEnumerable<Message>> ListBySessionAsync(Guid sessionId)
         {
-            return await _db.Messages.AsNoTracking().Where(m => m.SessionId == sessionId).ToListAsync();
+            return await _db.Messages.AsNoTracking()
+                .Where(m => m.SessionId == sessionId)
+                .OrderBy(m => m.CreatedAt)
+                .ThenBy(m => m.Id)
+                .ToListAsync();
         }
 
         public async Task DeleteBySessionAsync(Guid sessionId)

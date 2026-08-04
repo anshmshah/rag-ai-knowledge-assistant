@@ -133,14 +133,7 @@ namespace LocalRagAPI.Controllers
 
             var currentUserId = GetCurrentUserId();
 
-            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
-            {
-                await Response.WriteAsync("data: No documents uploaded. Please upload a document first.\n\n");
-                await Response.Body.FlushAsync();
-                return;
-            }
-
-            // determine or create session early so memory is scoped
+            // determine or create session early so memory and persistence are scoped
             ChatSession sessionEarly = null;
             if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sid2))
             {
@@ -155,6 +148,30 @@ namespace LocalRagAPI.Controllers
                     Title = "Chat",
                     ExpiresAt = DateTime.UtcNow.AddDays(30)
                 });
+            }
+            else if (currentUserId != Guid.Empty && sessionEarly.UserId != Guid.Empty && sessionEarly.UserId != currentUserId)
+            {
+                await Response.WriteAsync("data: Unauthorized session access.\n\n");
+                await Response.Body.FlushAsync();
+                await Response.WriteAsync("data: [DONE]\n\n");
+                await Response.Body.FlushAsync();
+                return;
+            }
+
+            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
+            {
+                var noDocsNotice = "No documents uploaded. Please upload a document first.";
+                try
+                {
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "user", Content = question });
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "assistant", Content = noDocsNotice });
+                }
+                catch { }
+                await Response.WriteAsync($"data: {noDocsNotice}\n\n");
+                await Response.Body.FlushAsync();
+                await Response.WriteAsync("data: [DONE]\n\n");
+                await Response.Body.FlushAsync();
+                return;
             }
 
             var history = _memory.BuildConversationHistory(currentUserId, sessionEarly.Id);
@@ -199,7 +216,14 @@ namespace LocalRagAPI.Controllers
 
             if (!candidateItems.Any())
             {
-                await Response.WriteAsync("data: This question is outside the scope of the uploaded documents.\n\n");
+                var outOfScopeNotice = "This question is outside the scope of the uploaded documents.";
+                try
+                {
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "user", Content = question });
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "assistant", Content = outOfScopeNotice });
+                }
+                catch { }
+                await Response.WriteAsync($"data: {outOfScopeNotice}\n\n");
                 await Response.Body.FlushAsync();
                 await Response.WriteAsync("data: [DONE]\n\n");
                 await Response.Body.FlushAsync();
@@ -211,7 +235,14 @@ namespace LocalRagAPI.Controllers
 
             if (!rerankedChunks.Any())
             {
-                await Response.WriteAsync("data: I cannot find that information in the uploaded documents.\n\n");
+                var notFoundNotice = "I cannot find that information in the uploaded documents.";
+                try
+                {
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "user", Content = question });
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "assistant", Content = notFoundNotice });
+                }
+                catch { }
+                await Response.WriteAsync($"data: {notFoundNotice}\n\n");
                 await Response.Body.FlushAsync();
                 await Response.WriteAsync("data: [DONE]\n\n");
                 await Response.Body.FlushAsync();
@@ -232,7 +263,7 @@ namespace LocalRagAPI.Controllers
             var combinedContext = contextBuilder.ToString();
             var prompt = _promptBuilder.BuildPrompt(combinedContext, history, question);
 
-            // use the earlier session and persist user message
+            // use the earlier session and persist user message (successful path)
             var session = sessionEarly;
 
             try
@@ -411,46 +442,7 @@ namespace LocalRagAPI.Controllers
         [HttpGet("ask-rag")]
         public async Task<RagResponse> AskRag(string question, string doc = null, string sessionId = null)
         {
-
             var currentUserId = GetCurrentUserId();
-
-            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
-            {
-                return new RagResponse
-                {
-                    Answer = "No documents uploaded. Please upload a document first.",
-                    Sources = new List<string>()
-                };
-            }
-
-            if (string.IsNullOrWhiteSpace(question))
-            {
-                return new RagResponse
-                {
-                    Answer = "Question cannot be empty.",
-                    Sources = new List<string>()
-                };
-            }
-
-            var lower = question.ToLower();
-
-            // =============================
-            // FAST GREETING SHORTCUT
-            // =============================
-            if (lower == "hello" || lower == "hi" || lower == "hey")
-            {
-                var quick = await _llm.GenerateResponse(question);
-
-                return new RagResponse
-                {
-                    Answer = quick,
-                    Sources = new List<string>()
-                };
-            }
-
-            // =============================
-            // STEP 1 — CONVERSATION HISTORY (scoped to user + session)
-            // =============================
 
             // determine or create session for this user
             ChatSession sessionEarly = null;
@@ -468,6 +460,67 @@ namespace LocalRagAPI.Controllers
                     ExpiresAt = DateTime.UtcNow.AddDays(30)
                 });
             }
+            else if (currentUserId != Guid.Empty && sessionEarly.UserId != Guid.Empty && sessionEarly.UserId != currentUserId)
+            {
+                return new RagResponse
+                {
+                    Answer = "Unauthorized session access.",
+                    Sources = new List<string>()
+                };
+            }
+
+            if (string.IsNullOrWhiteSpace(question))
+            {
+                return new RagResponse
+                {
+                    Answer = "Question cannot be empty.",
+                    Sources = new List<string>()
+                };
+            }
+
+            if (!await _qdrant.HasPointsAsync(doc, currentUserId == Guid.Empty ? null : currentUserId.ToString()))
+            {
+                var noDocsNotice = "No documents uploaded. Please upload a document first.";
+                try
+                {
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "user", Content = question });
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "assistant", Content = noDocsNotice });
+                }
+                catch { }
+
+                return new RagResponse
+                {
+                    Answer = noDocsNotice,
+                    Sources = new List<string>()
+                };
+            }
+
+            var lower = question.ToLower();
+
+            // =============================
+            // FAST GREETING SHORTCUT
+            // =============================
+            if (lower == "hello" || lower == "hi" || lower == "hey")
+            {
+                var quick = await _llm.GenerateResponse(question);
+
+                try
+                {
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "user", Content = question });
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "assistant", Content = quick });
+                }
+                catch { }
+
+                return new RagResponse
+                {
+                    Answer = quick,
+                    Sources = new List<string>()
+                };
+            }
+
+            // =============================
+            // STEP 1 — CONVERSATION HISTORY (scoped to user + session)
+            // =============================
 
             var history = _memory.BuildConversationHistory(currentUserId, sessionEarly.Id);
 
@@ -478,15 +531,6 @@ namespace LocalRagAPI.Controllers
             string rewrittenQuestion = question;
 
             bool needsRewrite = NeedsRewrite(question);
-
-            //old code works faster 11.03.26 12:19
-
-            //bool needsRewrite =
-            //    question.Split(" ").Length <= 3 ||
-            //    lower.Contains("it") ||
-            //    lower.Contains("they") ||
-            //    lower.Contains("this") ||
-            //    lower.Contains("that");
 
             if (needsRewrite)
             {
@@ -508,8 +552,6 @@ namespace LocalRagAPI.Controllers
             // STEP 3 — MULTI QUERY GENERATION
             // =============================
 
-   
-
             var queries = new List<string> { rewrittenQuestion };
 
             // =============================
@@ -522,7 +564,6 @@ namespace LocalRagAPI.Controllers
             // STEP 5 — PARALLEL VECTOR SEARCH
             // =============================
 
-
             var userIdStr = currentUserId == Guid.Empty ? null : currentUserId.ToString();
 
             // VECTOR SEARCH — retrieve larger candidate pool
@@ -534,13 +575,7 @@ namespace LocalRagAPI.Controllers
                 .ToList();
 
             // KEYWORD MATCHING (LOCAL)
-            var keywords = rewrittenQuestion
-                .ToLower()
-                .Split(" ", StringSplitOptions.RemoveEmptyEntries);
-
-
             var keywordItems = await _qdrant.KeywordSearch(rewrittenQuestion, doc, 50, userIdStr);
-            
 
             // Merge vector + keyword results, filter tiny chunks and deduplicate by content
             var candidateItems = vectorItems
@@ -550,13 +585,20 @@ namespace LocalRagAPI.Controllers
                 .Select(g => g.First())
                 .Take(60)
                 .ToList();
-            
 
             if (!candidateItems.Any())
             {
+                var outOfScopeNotice = "This question is outside the scope of the uploaded documents.";
+                try
+                {
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "user", Content = question });
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "assistant", Content = outOfScopeNotice });
+                }
+                catch { }
+
                 return new RagResponse
                 {
-                    Answer = "This question is outside the scope of the uploaded documents.",
+                    Answer = outOfScopeNotice,
                     Sources = new List<string>()
                 };
             }
@@ -571,9 +613,17 @@ namespace LocalRagAPI.Controllers
 
             if (!rerankedChunks.Any())
             {
+                var notFoundNotice = "I cannot find that information in the uploaded documents.";
+                try
+                {
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "user", Content = question });
+                    await _messageRepository.AddAsync(new Message { SessionId = sessionEarly.Id, Role = "assistant", Content = notFoundNotice });
+                }
+                catch { }
+
                 return new RagResponse
                 {
-                    Answer = "I cannot find that information in the uploaded documents.",
+                    Answer = notFoundNotice,
                     Sources = new List<string>()
                 };
             }
@@ -606,52 +656,12 @@ namespace LocalRagAPI.Controllers
             // STEP 8 — FINAL PROMPT
             // =============================
 
-
             var prompt = _promptBuilder.BuildPrompt(combinedContext, history, question);
 
-            
-
-            // session handling and persistence
-            ChatSession session = null;
-            if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out var sid))
-            {
-                session = await _chatSessionRepository.GetByIdAsync(sid);
-            }
-
-            if (session == null)
-            {
-                session = await _chatSessionRepository.CreateAsync(new ChatSession
-                {
-                    UserId = currentUserId,
-                    Title = "Chat",
-                    ExpiresAt = DateTime.UtcNow.AddDays(30)
-                });
-            }
+            var session = sessionEarly;
 
             try { await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "user", Content = question }); } catch { }
             try { _memory.AddUserMessage(currentUserId, session.Id, question); } catch { }
-
-
-            //var prompt = $@"
-            //    You are an AI assistant for answering questions from company documents.
-
-            //    Rules:
-            //    - Answer ONLY using the provided context.
-            //    - If the answer is not present say:
-            //    'I cannot find that information in the uploaded documents.'
-            //    - Always cite the source number like [Source 1].
-
-            //    Context:
-            //    {combinedContext}
-
-            //    Conversation History:
-            //    {history}
-
-            //    Question:
-            //    {question}
-
-            //    Provide a clear answer and include source citations.
-            //";
 
             var response = await _llm.GenerateResponse(prompt);
 
@@ -662,8 +672,6 @@ namespace LocalRagAPI.Controllers
                 .Replace("Detailed Explanation", "\n### Detailed Explanation\n")
                 .Replace("Explanation", "\n### Explanation\n")
                 .Replace("Sources", "\n### Sources\n");
-
-            
 
             // =============================
             // STEP 9 — SAVE MEMORY AND PERSIST
@@ -731,9 +739,12 @@ namespace LocalRagAPI.Controllers
         [HttpPost("chat")]
         public async Task<IActionResult> Chat([FromBody] ChatRequest req)
         {
-            var historyText = string.Join("\n",
-                req.History.TakeLast(10).Select(m => $"{m.Role}: {m.Content}")
-            );
+            if (string.IsNullOrWhiteSpace(req?.Question))
+                return BadRequest("Question cannot be empty.");
+
+            var historyText = req.History != null
+                ? string.Join("\n", req.History.TakeLast(10).Select(m => $"{m.Role}: {m.Content}"))
+                : string.Empty;
 
             var prompt = $"""
 You are a professional AI assistant helping users.
@@ -753,6 +764,31 @@ Assistant:
 """;
 
             var response = await _llm.GenerateResponse(prompt);
+
+            if (!string.IsNullOrEmpty(req.SessionId) && Guid.TryParse(req.SessionId, out var sid))
+            {
+                var currentUserId = GetCurrentUserId();
+                var session = await _chatSessionRepository.GetByIdAsync(sid);
+                if (session != null)
+                {
+                    if (currentUserId != Guid.Empty && session.UserId != Guid.Empty && session.UserId != currentUserId)
+                    {
+                        _logger.LogWarning("Unauthorized attempt by user {UserId} to write to session {SessionId} owned by {OwnerId}",
+                            currentUserId, session.Id, session.UserId);
+                        return Forbid();
+                    }
+
+                    try
+                    {
+                        await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "user", Content = req.Question });
+                        await _messageRepository.AddAsync(new Message { SessionId = session.Id, Role = "assistant", Content = response });
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to persist chat message to session {SessionId}", session.Id);
+                    }
+                }
+            }
 
             return Ok(new { answer = response });
         }
